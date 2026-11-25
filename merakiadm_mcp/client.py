@@ -135,7 +135,10 @@ class MerakiClient:
         while True:
             response = self._http.get(url, params=params)
             if response.status_code in (301, 302, 303, 307, 308):
-                location = urllib.parse.urljoin(url, response.headers.get("Location", ""))
+                raw_location = response.headers.get("Location", "").strip()
+                if not raw_location:
+                    raise MerakiAPIError(response.status_code, "redirect without a Location header", path)
+                location = urllib.parse.urljoin(url, raw_location)
                 target = urllib.parse.urlsplit(location)
                 host = target.hostname or ""
                 trusted = target.scheme == "https" and (host == "meraki.com" or host.endswith(".meraki.com"))

@@ -114,3 +114,10 @@ def test_get_all_follows_next_within_budget():
     items, capped = make().get_all("/organizations/1/devices", {"perPage": 1}, max_pages=2)
     assert [i["serial"] for i in items] == ["a", "b"]
     assert capped is True
+
+
+@respx.mock
+def test_redirect_without_location_is_refused():
+    respx.get(f"{BASE}/organizations").mock(return_value=httpx.Response(302))
+    with pytest.raises(MerakiAPIError, match="without a Location"):
+        make().get("/organizations")

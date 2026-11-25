@@ -203,14 +203,17 @@ def _one_network(network: Optional[str]) -> dict:
     return nets[0]
 
 
-def _device_names(org_id: str) -> dict[str, str]:
-    """serial -> device name (the serial itself when a device has no name)."""
+def _device_names(org_id: str) -> tuple[dict[str, str], bool]:
+    """(serial -> device name, capped). Unread devices fall back to their serial."""
 
     def load():
-        devices, _ = _get_client().get_all(f"/organizations/{org_id}/devices", {"perPage": 1000})
-        return {d["serial"]: d.get("name") or d["serial"] for d in devices if d.get("serial")}
+        devices, capped = _get_client().get_all(f"/organizations/{org_id}/devices", {"perPage": 1000}, max_pages=50)
+        return {d["serial"]: d.get("name") or d["serial"] for d in devices if d.get("serial")}, capped
 
     return _cached(f"devices:{org_id}", load)
+
+
+NAMES_CAPPED = "capped: the device inventory was not read to the end; some devices are shown by serial"
 
 
 def _ssid_names(net: dict) -> dict[int, str]:
@@ -421,7 +424,7 @@ def connection_failures(network: Optional[str] = None, hours: int = 24, top: int
     hours = _bound(hours, 1, MAX_HOURS)
     top = _bound(top, 1, 50)
     tz = _tz(net)
-    names = _device_names(net["organizationId"])
+    names, names_capped = _device_names(net["organizationId"])
     ssids = _ssid_names(net)
     stats = _connection_stats(net, hours)
     rows = _failed_connections(net, hours)
@@ -445,6 +448,8 @@ def connection_failures(network: Optional[str] = None, hours: int = 24, top: int
         per_ap[names.get(r.get("serial"), r.get("serial") or "?")][r.get("failureStep")] += 1
     ranked = sorted(per_ap.items(), key=lambda kv: -sum(kv[1].values()))
     lines.append(f"\n## Top access points ({min(top, len(ranked))} of {len(ranked)})")
+    if names_capped:
+        lines.append(f"- {NAMES_CAPPED}")
     for name, steps in ranked[:top]:
         lines.append(f"- {name}: {sum(steps.values()):,} ({_top(steps, 4)})")
     if len(ranked) > top:
@@ -702,7 +707,7 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
         org_id = net["organizationId"]
         products = net.get("productTypes") or []
         try:
-            names = _device_names(org_id)
+            names, names_capped = _device_names(org_id)
             avail, avail_capped = _get_client().get_all(
                 f"/organizations/{org_id}/devices/availabilities", {"networkIds[]": [net["id"]], "perPage": 1000}
             )
@@ -734,7 +739,7 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
                 body.append(f"- [CONNECT{'-HIGH-FAILURE' if flag else ''}] {summary}")
                 if flag:
                     per_ap = collections.Counter(names.get(r.get("serial"), r.get("serial")) for r in _failed_connections(net, hours))
-                    body.append(f"- [CONNECT-TOP-AP] {_top(per_ap, top)}")
+                    body.append(f"- [CONNECT-TOP-AP] {_top(per_ap, top)}{' (' + NAMES_CAPPED + ')' if names_capped else ''}")
 
             types = list(NOTABLE_EVENT_TYPES)
             counts: collections.Counter = collections.Counter()
