@@ -412,3 +412,30 @@ def test_long_windows_skip_the_comparison():
     text = server.connection_failures(hours=100, top=3)
     assert "previous" not in text
     assert all("t0" not in c.request.url.params for c in stats.calls)
+
+
+@respx.mock
+def test_device_down_at_window_start_is_not_a_new_outage():
+    base_routes()
+    respx.get(f"{BASE}/organizations/100/devices/availabilities/changeHistory").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                change("Q-AP1", "ap-1", _recent(50), "alerting", "offline"),
+                change("Q-AP1", "ap-1", _recent(40), "offline", "online"),
+            ],
+        )
+    )
+    text = server.availability_history(hours=1, top=5)
+    assert "- ap-1 0x 20 min (down at window start" in text
+
+
+@respx.mock
+def test_brief_says_when_availability_history_was_cut():
+    daily_routes({"success": 10})
+    nxt = f"<{BASE}/organizations/100/devices/availabilities/changeHistory?startingAfter=z>; rel=next"
+    respx.get(f"{BASE}/organizations/100/devices/availabilities/changeHistory").mock(
+        return_value=httpx.Response(200, json=[], headers={"Link": nxt})
+    )
+    text = server.daily_brief(hours=24, failure_threshold=10.0, top=3)
+    assert "no device left online in the 0 status changes read (capped" in text

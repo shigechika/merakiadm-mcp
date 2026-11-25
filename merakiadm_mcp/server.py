@@ -693,7 +693,8 @@ def operational_events(
     (apply/save failures), switch port (UDLD, err-disable, MAC flap, STP role
     and topology changes), roaming (L3 anchor failures) and event log
     (events_dropped2: the Dashboard dropped events, so the log is incomplete).
-    Counts per group and type, then the newest ``top`` events in detail.
+    Counts per group and type, then the newest ``top`` events in detail;
+    events_dropped2 entries are counted but not listed.
     Use list_events for high-volume types (association, port status).
 
     Args:
@@ -801,46 +802,59 @@ def _outages(net: dict, hours: int) -> tuple[list[dict], int, bool]:
     for change in sorted(changes, key=lambda c: c.get("ts") or ""):
         device = change.get("device") or {}
         key = device.get("serial") or device.get("name") or "?"
-        row = per.setdefault(
-            key,
-            {"name": device.get("name") or key, "product": device.get("productType") or "", "downs": 0, "seconds": 0.0, "down_since": None, "last": None},
-        )
         try:
             ts = datetime.datetime.fromisoformat(str(change.get("ts")).replace("Z", "+00:00"))
         except ValueError:
             continue
         old, new = _status_of(change, "old"), _status_of(change, "new")
+        if key not in per:
+            per[key] = {
+                "name": device.get("name") or key,
+                "product": device.get("productType") or "",
+                "downs": 0,
+                "seconds": 0.0,
+                # Not online before its first change in the window: down since the window began.
+                "down_since": start if old not in ("online", "?") else None,
+                "from_start": old not in ("online", "?"),
+                "last": None,
+            }
+        row = per[key]
         row["last"] = change.get("ts")
-        if new != "online" and row["down_since"] is None:
-            row["downs"] += 1
-            row["down_since"] = ts
-        elif new == "online":
-            began = row["down_since"] or (start if old != "online" else None)
-            if began is not None:
-                row["seconds"] += (ts - max(began, start)).total_seconds()
+        if new == "online":
+            if row["down_since"] is not None:
+                row["seconds"] += (ts - max(row["down_since"], start)).total_seconds()
             row["down_since"] = None
+        elif new != "?":
+            if old == "online":
+                row["downs"] += 1
+            if row["down_since"] is None:
+                row["down_since"] = ts
     rows = []
     for row in per.values():
         if row["down_since"] is not None:
             row["seconds"] += (now - max(row["down_since"], start)).total_seconds()
-        if row["downs"] or row["seconds"]:
+        if row["downs"] or row["seconds"] or row["from_start"]:
             rows.append({**row, "minutes": round(row["seconds"] / 60), "still_down": row["down_since"] is not None})
     rows.sort(key=lambda r: (-r["downs"], -r["minutes"]))
     return rows, len(changes), capped
 
 
 def _outage_text(row: dict, tz) -> str:
-    still = ", still down" if row["still_down"] else ""
-    return f"{row['name']} {row['downs']}x {row['minutes']} min (last change {_local(row['last'], tz)}{still})"
+    notes = ["down at window start"] if row["from_start"] else []
+    notes.append(f"last change {_local(row['last'], tz)}")
+    if row["still_down"]:
+        notes.append("still down")
+    return f"{row['name']} {row['downs']}x {row['minutes']} min ({', '.join(notes)})"
 
 
 @mcp.tool()
 def availability_history(network: Optional[str] = None, hours: int = 24, top: int = 20) -> str:
     """Which devices went offline (or alerting / dormant) and came back, from the availability change history.
 
-    For each device that left "online" in the window: how many times, the
-    minutes it spent not online within the window, the time of its last
-    change and whether it is still down. Answers "it drops out sometimes"
+    For each device that was not online at some point in the window: how
+    many times it left online, the minutes it spent not online within the
+    window, whether it was already down when the window began, the time of
+    its last change and whether it is still down. Answers "it drops out sometimes"
     questions that a point-in-time status cannot.
 
     Args:
@@ -969,6 +983,8 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
                     + (f" … capped: {len(outages) - top} more" if len(outages) > top else "")
                     + (" (capped: more changes not read)" if outage_capped else "")
                 )
+            elif outage_capped:
+                body.append(f"- [AVAILABILITY] no device left online in the {changes} status changes read (capped: more changes not read)")
             else:
                 body.append(f"- [AVAILABILITY] no device left online ({changes} status changes)")
 
