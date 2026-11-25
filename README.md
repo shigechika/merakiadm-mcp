@@ -1,3 +1,5 @@
+<!-- mcp-name: io.github.shigechika/merakiadm-mcp -->
+
 # merakiadm-mcp
 
 [日本語](README.ja.md) | [Documentation](https://shigechika.github.io/merakiadm-mcp/)
