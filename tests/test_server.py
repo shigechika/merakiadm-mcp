@@ -42,7 +42,8 @@ SSIDS = [
 
 
 @pytest.fixture(autouse=True)
-def fresh(monkeypatch):
+def fresh(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("MERAKI_DASHBOARD_API_KEY", "test-key")
     monkeypatch.delenv("MERAKI_ORG_ID", raising=False)
     monkeypatch.delenv("MERAKI_NETWORK_IDS", raising=False)
@@ -716,7 +717,7 @@ def test_api_get_stays_in_scope(monkeypatch):
     server.api_get("/organizations/100/devices/statuses", params={"networkIds": "N_1"})
     assert "networkIds" not in statuses.calls[1].request.url.params
     device = respx.get(f"{BASE}/devices/Q-AP1").mock(return_value=httpx.Response(200, json={"serial": "Q-AP1"}))
-    assert server.api_get("/devices/Q-AP1")["data"] == {"serial": "Q-AP1"} and device.called
+    assert server.api_get("/devices/Q-AP1")["data"] == {"serial": "Q-AP1", "deviceName": "ap-1"} and device.called
 
 
 @respx.mock
@@ -792,3 +793,107 @@ def test_api_get_windows_the_list_inside_an_object():
     result = server.api_get("/networks/N_1/events", fields=["n"], offset=5, limit=3)
     assert result["list_key"] == "events" and result["total_items"] == 30 and result["capped"] is True
     assert result["data"] == {"message": None, "pageStartAt": "x", "events": [{"n": 5}, {"n": 6}, {"n": 7}]}
+
+
+@respx.mock
+def test_api_get_takes_json_strings_pages_and_names_serials():
+    base_routes()
+    first = [{"serial": "Q-AP1", "x": 1}, {"serial": "Q-AP2", "x": 2}]
+    link = f'<{BASE}/organizations/100/devices/statuses?startingAfter=Q-AP2>; rel=next'
+    route = respx.get(f"{BASE}/organizations/100/devices/statuses").mock(
+        side_effect=lambda r: httpx.Response(200, json=[{"serial": "Q-SW1", "x": 3}])
+        if r.url.params.get("startingAfter")
+        else httpx.Response(200, json=first, headers={"Link": link})
+    )
+    result = server.api_get("/organizations/100/devices/statuses", params='{"perPage": 2}', fields='["serial"]', max_pages=3)
+    assert route.call_count == 2 and result["pages_read"] == 2 and result["has_next_page"] is False
+    assert result["total_items"] == 3 and result["observed_at"].endswith("Z")
+    assert result["data"] == [{"serial": "Q-AP1", "deviceName": "ap-1"}, {"serial": "Q-AP2", "deviceName": "ap-2"}, {"serial": "Q-SW1", "deviceName": "sw-1"}]
+    with pytest.raises(ToolError, match="params must be a JSON object"):
+        server.api_get("/networks/N_1/clients", params="perPage=2")
+
+
+@respx.mock
+def test_find_api_keeps_its_index_between_processes():
+    base_routes()
+    spec = spec_route()
+    server.find_api("wireless ssids")
+    server._cache.clear()  # a new process
+    assert server.find_api("snmp").splitlines()[1].startswith("- getNetworkSnmp")
+    assert spec.call_count == 1
+    respx.get(f"{BASE}/networks/N_1/wireless/ssids").mock(return_value=httpx.Response(200, json=[]))
+    assert server.api_get("/networks/N_1/wireless/ssids")["operation"] == "getNetworkWirelessSsids"
+
+
+@respx.mock
+def test_health_check_lists_ids_for_api_get():
+    base_routes()
+    respx.get(f"{BASE}/organizations/100/devices/statuses/overview").mock(return_value=httpx.Response(200, json={"counts": {"byStatus": {"online": 3}}}))
+    result = server.health_check()
+    assert result["organization_list"] == [{"id": "100", "name": "Example Org"}]
+    assert result["network_list"] == [{"id": "N_1", "name": "Example Net", "products": ["switch", "wireless"]}]
+
+
+@respx.mock
+def test_resolve_entity_finds_networks_and_devices():
+    base_routes()
+    respx.get(f"{BASE}/organizations/100/devices").mock(return_value=httpx.Response(200, json=[
+        {"serial": "Q-AP1", "name": "ap-1", "model": "CW9174I", "mac": "aa:bb:cc:00:00:01", "lanIp": "10.0.0.11", "networkId": "N_1"},
+        {"serial": "Q-ZZ", "name": "ap-out", "mac": "aa:bb:cc:00:00:09", "networkId": "N_9"},
+    ]))
+    text = server.resolve_entity("AABB.CC00.0001")
+    assert "- ap-1: serial Q-AP1, CW9174I, MAC aa:bb:cc:00:00:01, LAN IP 10.0.0.11, network Example Net (N_1)" in text
+    assert "ap-out" not in server.resolve_entity("ap")
+    assert "networkId N_1" in server.resolve_entity("example")
+    assert "find_client" in server.resolve_entity("10.9.9.9")
+
+
+@respx.mock
+def test_find_client_by_mac_shows_record_and_wireless_history():
+    base_routes()
+    respx.get(f"{BASE}/organizations/100/clients/search").mock(return_value=httpx.Response(200, json={
+        "clientId": "k1", "mac": "11:22:33:44:55:66", "manufacturer": "Acme",
+        "records": [{"network": {"id": "N_1"}, "ip": "10.1.1.5", "ssid": "CorpNet", "lastSeen": 1795600000}],
+    }))
+    respx.get(f"{BASE}/networks/N_1/clients/k1").mock(return_value=httpx.Response(200, json={
+        "id": "k1", "mac": "11:22:33:44:55:66", "ip": "10.1.1.5", "vlan": 10, "ssid": "CorpNet", "user": "u1",
+        "recentDeviceSerial": "Q-AP1", "status": "Online", "lastSeen": 1795600000, "notes": '{"psk": "x"}',
+    }))
+    respx.get(f"{BASE}/networks/N_1/wireless/clients/k1/connectionStats").mock(return_value=httpx.Response(200, json={"connectionStats": {"assoc": 0, "auth": 0, "dhcp": 2, "dns": 0, "success": 8}}))
+    respx.get(f"{BASE}/networks/N_1/wireless/clients/k1/connectivityEvents").mock(return_value=httpx.Response(200, json=[
+        {"type": "association", "severity": "info", "deviceSerial": "Q-AP1", "rssi": 40, "occurredAt": "2026-11-25T01:00:00Z"},
+        {"type": "dhcp", "subtype": "dhcp_timeout", "severity": "bad", "deviceSerial": "Q-AP2", "rssi": 12, "occurredAt": "2026-11-25T02:00:00Z", "band": "5", "channel": 36},
+    ]))
+    respx.get(f"{BASE}/networks/N_1/wireless/clients/k1/latencyStats").mock(return_value=httpx.Response(200, json={"latencyStats": {"bestEffortTraffic": {"avg": 4.25}}}))
+    text = server.find_client("11-22-33-44-55-66", hours=24)
+    assert "matched by MAC" in text and "VLAN 10" in text and "User u1" in text and "Last connected to ap-1" in text
+    assert "20.0% failed" in text and "By access point: ap-1 1 (RSSI 40..40 dB), ap-2 1" in text
+    assert "11:00 dhcp/dhcp_timeout (bad) at ap-2" in text or "dhcp/dhcp_timeout (bad) at ap-2" in text
+    assert "average 4.2 ms" in text or "average 4.3 ms" in text
+
+
+@respx.mock
+def test_find_client_by_name_scans_a_bounded_list():
+    base_routes()
+    rows = [{"id": f"k{i}", "mac": f"00:00:00:00:00:{i:02x}", "user": "alice" if i == 3 else "bob", "lastSeen": i} for i in range(10)]
+    respx.get(f"{BASE}/networks/N_1/clients").mock(return_value=httpx.Response(200, json=rows))
+    respx.get(f"{BASE}/networks/N_1/clients/k3").mock(return_value=httpx.Response(200, json={**rows[3], "ssid": None}))
+    text = server.find_client("ALICE")
+    assert "among 10 clients of the last 1h" in text and "User alice" in text
+
+
+@respx.mock
+def test_find_client_by_ip_keeps_only_the_exact_address():
+    base_routes()
+    rows = [{"id": "k1", "mac": "m1", "ip": "10.0.0.95", "lastSeen": 2}, {"id": "k2", "mac": "m2", "ip": "10.0.0.9", "lastSeen": 1}]
+    respx.get(f"{BASE}/networks/N_1/clients").mock(return_value=httpx.Response(200, json=rows))
+    respx.get(f"{BASE}/networks/N_1/clients/k2").mock(return_value=httpx.Response(200, json={**rows[1], "recentDeviceSerial": "Q-AP2"}))
+    text = server.find_client("10.0.0.9")
+    assert "clients matched" not in text and "IP 10.0.0.9," in text and "Last connected to ap-2" in text
+
+
+def test_other_serial_keys_get_a_name(monkeypatch):
+    monkeypatch.setattr(server, "_organizations", lambda: [ORG])
+    monkeypatch.setattr(server, "_device_names", lambda org: ({"Q-AP1": "ap-1"}, False))
+    assert server._name_serials([{"recentDeviceSerial": "Q-AP1"}, {"deviceSerial": "Q-AP1"}]) == [
+        {"recentDeviceSerial": "Q-AP1", "recentDeviceName": "ap-1"}, {"deviceSerial": "Q-AP1", "deviceName": "ap-1"}]

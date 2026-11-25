@@ -9,7 +9,8 @@ clamped to the ranges below. When a tool leaves something out it says
 No arguments. Returns a dict with fixed keys: `status` (healthy / degraded /
 error), `service`, `version`, `base_url`, `auth` (ok / error / missing-env),
 `organizations`, `networks`, `devices` (counts by status), and `detail` when
-not healthy. Degraded means a device is offline or alerting.
+not healthy. When the key works it also lists `organization_list` and
+`network_list` (IDs and names, at most 20 and 50) for `api_get` paths. Degraded means a device is offline or alerting.
 
 ## daily_brief
 
@@ -162,8 +163,13 @@ operation's summary, description and parameters.
 | `offset` | 0 | first list item |
 | `limit` | 20 | 1-200 list items |
 | `max_chars` | 20000 | 2000-60000 characters |
+| `max_pages` | 1 | 1-5 pages, following next links within 30 seconds |
 
-Returns a dict: `path`, `params`, `total_items` / `offset` / `returned` (and
+`params` and `fields` are also accepted as JSON-encoded strings (some
+clients send them that way); `fields` also as a comma-separated string.
+
+Returns a dict: `path`, `observed_at` (UTC), `operation` (the operation ID,
+when the index is already cached), `params`, `pages_read`, `has_next_page`, `total_items` / `offset` / `returned` (and
 `list_key` when the list sits inside an object, such as `events`),
 `redacted` (how many values were masked), `next_params` / `prev_params`,
 `capped`, `note` and `data`.
@@ -181,3 +187,39 @@ Returns a dict: `path`, `params`, `total_items` / `offset` / `returned` (and
 - The answer is cut to `limit` items and shrunk to `max_chars`: long nested
   lists and strings are shortened, then items are dropped; if even that is
   too large, only the keys are returned. Any of these sets `capped`.
+- Every `serial` of a device in scope gets a `deviceName`; another key
+  ending in `Serial` gets the matching `…Name` (`recentDeviceSerial` →
+  `recentDeviceName`).
+- The operation index behind `find_api` is kept for six hours in memory and
+  in `$XDG_CACHE_HOME/merakiadm-mcp/` (or `~/.cache/merakiadm-mcp/`), so a
+  server started per call reads the 4 MB spec only once in a while; when the
+  directory is not writable it is fetched again.
+
+## resolve_entity
+
+| Argument | Default | Range |
+|---|---|---|
+| `query` | required | name or part of one, ID, serial, MAC or IP |
+| `top` | 10 | 1-50 matches per kind |
+
+Organizations by ID and name, networks by ID and name, devices by serial,
+name, MAC and LAN IP, from the inventory in scope. Clients are looked up
+with `find_client`.
+
+## find_client
+
+| Argument | Default | Range |
+|---|---|---|
+| `query` | required | MAC, IPv4/IPv6 address, or part of a user name or description |
+| `network` | the only network in scope | name or ID |
+| `hours` | 1 | 1-24 |
+| `top` | 5 | 1-20 other matches and events |
+
+A MAC is looked up directly (organization client search). An IP searches the
+clients of the last `hours` and keeps the exact address (the API matches a
+prefix); a day takes about 25 seconds at a busy site. A name scans at most
+5,000 clients of the last `hours` and says `capped` when there were more.
+For the most recently seen match: the client record and, for a wireless
+client, its connection stats per step, connectivity events by type and by
+access point with the signal range, the latest `bad` events, and average
+best-effort latency.

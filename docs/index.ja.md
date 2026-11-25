@@ -29,6 +29,8 @@ Cisco Meraki Dashboard の管理者向けの、読み取り専用の MCP サー�
 | `air_marshal` | 周りの SSID：総数、自分の有線 LAN で見えた SSID（野良 AP）、自分の SSID 名を名乗る SSID |
 | `security_events` | 野良や重複の DHCP サーバ、AP のなりすまし、野良 AP への関連付け、IP・IPv6 の重複、RA Guard、ループ、STP のガード |
 | `list_events` | イベントの記録を 1 ページずつ。続きを読む `older_cursor` と、読み切ったかの `complete` を返す |
+| `resolve_entity` | 名前・シリアル・MAC・LAN の IP から、組織・ネットワーク・機器の ID を引く |
+| `find_client` | 端末を MAC・IP・ユーザ名や端末名で探し、記録、最後の AP かスイッチのポート、無線の接続、AP ごとのイベントと電波の強さ、最近の問題、遅延を示す |
 | `find_api` | Dashboard の読み取り（GET）の API を英語のキーワードで探す。1 つの API の引数も示す |
 | `api_get` | 任意の読み取りの API を呼ぶ：1 ページだけ、`fields` / `offset` / `limit`、量の上限、秘密は `[redacted]`、対象範囲の外は読まない |
 

@@ -31,6 +31,8 @@ All tools are read-only (GET only) and annotated `readOnlyHint`.
 | `air_marshal` | Neighbouring SSIDs: totals, SSIDs seen on your wired LAN (rogues), SSIDs using one of your SSID names |
 | `security_events` | Rogue/duplicate DHCP servers, AP spoofing, rogue AP association, IP/IPv6 conflicts, RA guard, loops, STP guards |
 | `list_events` | One page of the event log with an `older_cursor` to continue and a `complete` flag |
+| `resolve_entity` | Organization, network and device IDs from a name, serial, MAC or LAN IP |
+| `find_client` | A client by MAC, IP or user/description: its record, last AP or switch port, and its wireless connections, events per AP with signal, latest problems, latency |
 | `find_api` | Search the Dashboard's read (GET) operations by English keywords, or show one operation's parameters |
 | `api_get` | Call any read operation: one page, `fields` / `offset` / `limit`, a size limit, secrets masked as `[redacted]`, scope enforced |
 

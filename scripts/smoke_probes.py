@@ -76,6 +76,15 @@ PROBES: dict[str, Probe] = {
         must_not_match=NO_ERROR,
         timeout=60,
     ),
+    "resolve_entity": Probe(
+        args={"query": "a", "top": 3},
+        must_match=(r"^# Matches for ",),
+        must_not_match=NO_ERROR,
+        timeout=60,
+    ),
+    "find_client": Probe(
+        skip="needs a client MAC or IP, which this public file may not name; covered by the live checks before a release",
+    ),
     "air_marshal": Probe(
         args_factory=_single_network,
         args={"hours": 1, "top": 3},

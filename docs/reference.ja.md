@@ -8,7 +8,8 @@
 引数なし。決まったキーの dict を返します：`status`（healthy / degraded /
 error）、`service`、`version`、`base_url`、`auth`（ok / error / missing-env）、
 `organizations`、`networks`、`devices`（状態別の台数）、健全でないときは
-`detail`。オフラインか警告の機器があると degraded です。
+`detail`。キーが効くときは、`api_get` のパスに使う `organization_list` と
+`network_list`（ID と名前。20 と 50 まで）も返します。オフラインか警告の機器があると degraded です。
 
 ## daily_brief
 
@@ -155,8 +156,13 @@ WARNING にし、レーダー、チャネル変更、取りこぼしは参考と
 | `offset` | 0 | 一覧の何件目から |
 | `limit` | 20 | 一覧の件数（1〜200） |
 | `max_chars` | 20000 | 文字数の上限（2000〜60000） |
+| `max_pages` | 1 | 次のページを 30 秒以内でたどる数（1〜5） |
 
-dict を返します：`path`、`params`、`total_items` / `offset` / `returned`（一覧が
+`params` と `fields` は JSON の文字列でも受け付けます（そう送るクライアントが
+あるため）。`fields` はカンマ区切りの文字列でも構いません。
+
+dict を返します：`path`、`observed_at`（UTC）、`operation`（API の一覧を覚えて
+いるときの operation ID）、`params`、`pages_read`、`has_next_page`、`total_items` / `offset` / `returned`（一覧が
 オブジェクトの中にあるとき、たとえば `events` は `list_key` も）、`redacted`
 （伏せた値の数）、`next_params` / `prev_params`、`capped`、`note`、`data`。
 
@@ -172,3 +178,34 @@ dict を返します：`path`、`params`、`total_items` / `offset` / `returned`
 - 答えは `limit` 件に切り、`max_chars` に収まるよう縮めます：長い入れ子の一覧と
   文字列を短くし、それでも足りなければ要素を減らし、なお大きければキーだけを
   返します。どれかが起きると `capped` になります。
+- 対象範囲の機器の `serial` には `deviceName` を、ほかの `Serial` で終わるキーには
+  対応する `…Name`（`recentDeviceSerial` → `recentDeviceName`）を添えます。
+- `find_api` の API の一覧は、メモリと `$XDG_CACHE_HOME/merakiadm-mcp/`（なければ
+  `~/.cache/merakiadm-mcp/`）に 6 時間覚えておきます。呼び出しごとに起動する使い方
+  でも 4 MB の仕様をたまにしか読みません。書けないときは毎回取り直します。
+
+## resolve_entity
+
+| 引数 | 既定 | 範囲 |
+|---|---|---|
+| `query` | 必須 | 名前やその一部、ID、シリアル、MAC、IP |
+| `top` | 10 | 種類ごとの件数（1〜50） |
+
+対象範囲の一覧から、組織（ID・名前）、ネットワーク（ID・名前）、機器（シリアル・
+名前・MAC・LAN の IP）を引きます。端末は `find_client` で探します。
+
+## find_client
+
+| 引数 | 既定 | 範囲 |
+|---|---|---|
+| `query` | 必須 | MAC、IPv4/IPv6 のアドレス、ユーザ名や端末名の一部 |
+| `network` | 対象が 1 つならそれ | 名前か ID |
+| `hours` | 1 | 1〜24 |
+| `top` | 5 | ほかの候補とイベントの件数（1〜20） |
+
+MAC はそのまま引きます（組織の端末検索）。IP は直近 `hours` の端末から探し、
+アドレスが完全に一致するものだけ残します（API は前方一致で返すため）。利用者の
+多い拠点では 1 日分で 25 秒ほどかかります。名前は直近 `hours` の端末を 5,000 台
+まで見て、それより多ければ `capped` と書きます。一番最近見えた候補について、端末の
+記録と、無線の端末なら段階ごとの接続、種類と AP ごとのイベントと電波の強さの幅、
+最近の `bad` のイベント、ベストエフォートの平均の遅延を出します。

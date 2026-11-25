@@ -25,10 +25,11 @@ MERAKI_DASHBOARD_API_KEY=... .venv/bin/python scripts/smoke_test.py   # live smo
   `meraki.com` hosts (httpx drops the
   Authorization header on cross-host redirects). 429 and 5xx are retried with
   `Retry-After` within a retry budget. httpx/httpcore logging is held at WARNING.
-- `merakiadm_mcp/server.py` — `MCPServer` with 11 tools: `health_check`,
+- `merakiadm_mcp/server.py` — `MCPServer` with 13 tools: `health_check`,
   `daily_brief`, `connection_failures`, `wireless_quality`, `availability_history`, `air_marshal`,
-  `security_events`, `operational_events`, `list_events`, and the generic pair
-  `find_api` (searches the org's own OpenAPI spec, cached 6 h) / `api_get`. Event type sets
+  `security_events`, `operational_events`, `list_events`, `resolve_entity`,
+  `find_client`, and the generic pair `find_api` (searches the org's own
+  OpenAPI spec, cached 6 h in memory and in the user cache directory) / `api_get`. Event type sets
   live in `SECURITY_EVENT_TYPES` and `OPERATIONAL_EVENT_GROUPS` (the latter
   holds only rare types; `OPERATIONAL_WARN_TYPES` decides what raises a
   WARNING in `daily_brief`). `_Server.tool` marks every tool read-only and turns

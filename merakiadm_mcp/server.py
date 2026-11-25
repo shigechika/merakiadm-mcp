@@ -15,15 +15,18 @@ import collections
 import datetime
 import difflib
 import functools
+import hashlib
 import inspect
 import ipaddress
 import json
 import os
+import pathlib
 import re
 import time
 from typing import Any, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import httpx
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.exceptions import MCPError
@@ -507,7 +510,9 @@ def health_check() -> dict:
 
     Always returns the same keys: ``status`` (healthy / degraded / error),
     ``service``, ``version``, ``base_url``, ``auth`` (ok / error /
-    missing-env), ``organizations`` and ``networks`` (counts) and ``devices``
+    missing-env), ``organizations`` and ``networks`` (counts), when the key
+    works ``organization_list`` and ``network_list`` (IDs and names, at most 20
+    and 50, for api_get paths) and ``devices``
     (counts by status: online / alerting / offline / dormant, limited to
     MERAKI_NETWORK_IDS when set). A degraded or error result adds ``detail``.
     """
@@ -525,7 +530,14 @@ def health_check() -> dict:
         orgs = _organizations()
         result["auth"] = "ok"
         result["organizations"] = len(orgs)
-        result["networks"] = len(_networks())
+        nets = _networks()
+        result["networks"] = len(nets)
+        result["organization_list"] = [{"id": str(o.get("id")), "name": o.get("name")} for o in orgs[:20]]
+        result["network_list"] = [
+            {"id": n.get("id"), "name": n.get("name"), "products": n.get("productTypes") or []} for n in nets[:50]
+        ]
+        if len(nets) > 50:
+            result["network_list_capped"] = f"{len(nets) - 50} more networks not listed"
         totals: collections.Counter = collections.Counter()
         scoped = bool(_env_list("MERAKI_NETWORK_IDS"))
         for org in orgs:
@@ -1182,6 +1194,208 @@ def wireless_quality(network: Optional[str] = None, hours: int = 24, top: int = 
 
 
 # --------------------------------------------------------------------------
+# names to IDs, and clients
+# --------------------------------------------------------------------------
+
+_MAC_RE = re.compile(r"^[0-9a-f]{2}([:-]?)[0-9a-f]{2}(\1[0-9a-f]{2}){4}$|^[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}$", re.I)
+CLIENT_SCAN_PAGES = 5
+
+
+def _norm_mac(text: str) -> str:
+    raw = re.sub(r"[^0-9a-f]", "", text.lower())
+    return ":".join(raw[i : i + 2] for i in range(0, 12, 2))
+
+
+@mcp.tool()
+def resolve_entity(query: str, top: int = 10) -> str:
+    """Turn a name, ID, serial, MAC or IP into the Meraki IDs other tools and api_get need.
+
+    Matches (case-insensitive, whole or part) organizations by ID and name,
+    networks by ID and name, and devices (access points, switches...) by
+    serial, name, MAC and LAN IP, from the inventory in scope. A client
+    (a laptop or phone) is not a device here: use find_client for those.
+
+    Args:
+        query: A name or part of one, an ID, a serial, a MAC or an IP address.
+        top: How many matches to list per kind (1-50, default 10).
+    """
+    top = _bound(top, 1, 50)
+    q = (query or "").strip().lower()
+    if not q:
+        raise ToolError("query is empty")
+    mac = _norm_mac(q) if _MAC_RE.match(q) else None
+    orgs = [o for o in _organizations() if q in str(o.get("id")).lower() or q in (o.get("name") or "").lower()]
+    nets_all = _networks()
+    net_names = {n["id"]: n.get("name") or n["id"] for n in nets_all}
+    nets = [n for n in nets_all if q in n["id"].lower() or q in (n.get("name") or "").lower()]
+    devices, capped = [], False
+    for org in _organizations():
+        inv, more = _devices(str(org["id"]))
+        capped = capped or more
+        for d in inv:
+            if d.get("networkId") not in net_names:
+                continue
+            fields = [d.get("serial"), d.get("name"), d.get("lanIp"), d.get("mac")]
+            if (mac and (d.get("mac") or "").lower() == mac) or any(q in str(f).lower() for f in fields if f):
+                devices.append(d)
+    lines = [f"# Matches for {query!r}"]
+    for title, rows, render in (
+        ("Organizations", orgs, lambda o: f"- {o.get('name')}: organizationId {o.get('id')}"),
+        ("Networks", nets, lambda n: f"- {n.get('name')}: networkId {n['id']} ({', '.join(n.get('productTypes') or [])})"),
+        (
+            "Devices",
+            devices,
+            lambda d: f"- {d.get('name') or d.get('serial')}: serial {d.get('serial')}, {d.get('model')}, MAC {d.get('mac')}, "
+            f"LAN IP {d.get('lanIp') or '-'}, network {net_names.get(d.get('networkId'))} ({d.get('networkId')})",
+        ),
+    ):
+        if rows:
+            lines.append(f"\n## {title} ({min(top, len(rows))} of {len(rows)})")
+            lines.extend(render(r) for r in rows[:top])
+            if len(rows) > top:
+                lines.append(f"- capped: {len(rows) - top} more not listed (be more specific or raise top=)")
+    if capped:
+        lines.append(f"- {NAMES_CAPPED}")
+    if len(lines) == 1:
+        lines.append("- Nothing in scope matched." + (" A client (laptop, phone) is looked up with find_client." if mac or _is_ip(q) else ""))
+    return "\n".join(lines)
+
+
+def _is_ip(text: str) -> bool:
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+
+
+def _client_matches(net: dict, query: str, hours: int) -> tuple[list[dict], str, bool]:
+    """Clients of a network matching ``query``: (clients, how they were looked up, capped)."""
+    q = query.strip()
+    if _MAC_RE.match(q):
+        mac = _norm_mac(q)
+        found = _get_client().get(f"/organizations/{net['organizationId']}/clients/search", {"mac": mac}) or {}
+        cid = found.get("clientId")
+        rows = [r for r in found.get("records") or [] if (r.get("network") or {}).get("id") == net["id"]]
+        return ([{**r, "id": cid, "mac": found.get("mac") or mac, "manufacturer": found.get("manufacturer")} for r in rows][:1], "MAC", False)
+    if _is_ip(q):
+        key = "ip" if ipaddress.ip_address(q).version == 4 else "ip6"
+        rows = _get_client().get(f"/networks/{net['id']}/clients", {key: q, "timespan": hours * 3600, "perPage": 100}) or []
+        wanted = ipaddress.ip_address(q)
+        exact = []
+        for r in rows:  # the API matches a prefix: 10.0.0.9 also returns 10.0.0.95
+            try:
+                if r.get(key) and ipaddress.ip_address(r[key]) == wanted:
+                    exact.append(r)
+            except ValueError:
+                continue
+        return exact, f"IP over the last {hours}h", False
+    needle = q.lower()
+    rows, capped = _get_client().get_all(
+        f"/networks/{net['id']}/clients", {"timespan": hours * 3600, "perPage": 1000}, CLIENT_SCAN_PAGES
+    )
+    hits = [r for r in rows if any(needle in str(r.get(k) or "").lower() for k in ("user", "description", "notes"))]
+    return hits, f"user / description among {len(rows):,} clients of the last {hours}h", capped
+
+
+@mcp.tool()
+def find_client(query: str, network: Optional[str] = None, hours: int = 1, top: int = 5) -> str:
+    """Find a client (laptop, phone...) and show where it connects and how it fares.
+
+    ``query`` is a MAC address, an IP address (IPv4 or IPv6), or part of a
+    user name or device description. A MAC is looked up directly; an IP or a
+    name searches the clients seen in the last ``hours`` (an IP over a day
+    takes about 25 seconds at a busy site; a name scans at most 5,000
+    clients and says capped when there were more). For the best match it
+    shows the client record (IP, VLAN, SSID, user, OS, last access point or
+    switch port) and, for wireless clients over the last ``hours``, its
+    connection stats per step, connectivity events by type and access point
+    with signal strength, the latest problems, and latency.
+
+    Args:
+        query: MAC, IP, or part of a user name or description.
+        network: Network name or ID; may be omitted when only one is in scope.
+        hours: Look-back window for the search and the history, 1-24 (default 1).
+        top: How many other matches and events to list (1-20, default 5).
+    """
+    net = _one_network(network)
+    hours = _bound(hours, 1, 24)
+    top = _bound(top, 1, 20)
+    if not (query or "").strip():
+        raise ToolError("query is empty")
+    tz = _tz(net)
+    names, _ = _device_names(net["organizationId"])
+    try:
+        rows, how, capped = _client_matches(net, query, hours)
+    except httpx.TimeoutException:
+        raise ToolError(f"the Dashboard took too long to search the clients of the last {hours}h; ask with a smaller hours=") from None
+    lines = [f"# Client {query!r} — {net.get('name')} (matched by {how})"]
+    if capped:
+        lines.append("- capped: more clients were seen than were scanned; give a MAC or IP, or a smaller hours=")
+    if not rows:
+        lines.append("- No client matched.")
+        return "\n".join(lines)
+    rows.sort(key=lambda r: str(r.get("lastSeen") or ""), reverse=True)
+    if len(rows) > 1:
+        lines.append(f"- {len(rows)} clients matched; showing the most recently seen. Others: " + ", ".join(
+            f"{r.get('description') or r.get('user') or r.get('mac')} ({r.get('mac')}, {r.get('ip') or '-'})" for r in rows[1 : 1 + top]
+        ) + (f" … capped: {len(rows) - 1 - top} more" if len(rows) - 1 > top else ""))
+    hit = rows[0]
+    cid = hit.get("id")
+    detail = _get_client().get(f"/networks/{net['id']}/clients/{cid}") if cid else hit
+    detail = _redact(detail or hit, [0])
+    where = detail.get("recentDeviceName") or names.get(detail.get("recentDeviceSerial"), detail.get("recentDeviceSerial"))
+    lines += [
+        f"- MAC {detail.get('mac')}, IP {detail.get('ip') or '-'}, IPv6 {detail.get('ip6') or '-'}, VLAN {detail.get('vlan') or detail.get('namedVlan') or '-'}",
+        f"- User {detail.get('user') or '-'}, description {detail.get('description') or '-'}, OS {detail.get('os') or '-'}, maker {detail.get('manufacturer') or '-'}",
+        f"- Status {detail.get('status') or '-'}, SSID {detail.get('ssid') or '-'}, last seen {_local(detail.get('lastSeen'), tz)}, first seen {_local(detail.get('firstSeen'), tz)}",
+        f"- Last connected to {where or '-'}" + (f" port {detail.get('switchport')}" if detail.get("switchport") else ""),
+    ]
+    if not cid or "wireless" not in (net.get("productTypes") or []) or not detail.get("ssid"):
+        return "\n".join(lines)
+
+    base = f"/networks/{net['id']}/wireless/clients/{cid}"
+    window = {"timespan": hours * 3600}
+    stats = (_get_client().get(f"{base}/connectionStats", window) or {}).get("connectionStats") or {}
+    summary, _ = _success_line(stats)
+    lines.append(f"\n## Wireless, last {hours}h")
+    lines.append(f"- Connections: {summary}")
+    page = _get_client().page(f"{base}/connectivityEvents", {**window, "perPage": 1000})
+    events = page.data or []
+    if events:
+        lines.append(f"- Connectivity events: {len(events):,}{' (capped: more than one page; shorten hours=)' if page.links.get('next') else ''}")
+        lines.append(f"- By type: {_top(collections.Counter(e.get('type') for e in events), 10)}")
+        per_ap: dict[str, list[int]] = collections.defaultdict(list)
+        for e in events:
+            ap = names.get(e.get("deviceSerial"), e.get("deviceSerial") or "?")
+            rssi = e.get("rssi")
+            per_ap[ap].append(int(rssi) if isinstance(rssi, (int, float)) and rssi > 0 else 0)  # -1 means unknown
+        ranked = sorted(per_ap.items(), key=lambda kv: -len(kv[1]))
+        lines.append(
+            "- By access point: "
+            + ", ".join(
+                f"{ap} {len(v)} (RSSI {min(x for x in v if x) if any(v) else '-'}..{max(x for x in v if x) if any(v) else '-'} dB)"
+                for ap, v in ranked[:top]
+            )
+            + (f" … capped: {len(ranked) - top} more" if len(ranked) > top else "")
+        )
+        bad = [e for e in events if (e.get("severity") or "").lower() not in ("", "info", "good")]
+        if bad:
+            lines.append(f"\n## Latest problems ({min(top, len(bad))} of {len(bad)})")
+            for e in sorted(bad, key=lambda e: str(e.get("occurredAt")), reverse=True)[:top]:
+                lines.append(
+                    f"- {_local(e.get('occurredAt'), tz)} {e.get('type')}/{e.get('subtype')} ({e.get('severity')}) at "
+                    f"{names.get(e.get('deviceSerial'), e.get('deviceSerial'))}, band {e.get('band')} ch {e.get('channel')}, RSSI {e.get('rssi')}"
+                )
+    else:
+        lines.append("- No connectivity events in this window.")
+    lat = ((_get_client().get(f"{base}/latencyStats", window) or {}).get("latencyStats") or {}).get("bestEffortTraffic") or {}
+    if lat.get("avg") is not None:
+        lines.append(f"- Best-effort latency: average {float(lat['avg']):.1f} ms")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
 # switch uplinks
 # --------------------------------------------------------------------------
 
@@ -1215,6 +1429,9 @@ _SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.:~-]{1,128}$")
 _PARAM_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}(\[\])?$")
 API_INDEX_SECONDS = 6 * 3600
 API_MAX_CHARS = 20_000
+API_MAX_PAGES = 5
+_SERIAL_KEY = re.compile(r"(^serial|Serial)$")
+API_PAGES_SECONDS = 30.0
 NOTE_CAPPED = "part of the answer was left out: use fields=, offset=/limit= or narrower params"
 REDACTED = "[redacted]"
 #: A key is secret when its lower-cased name contains one of these. Booleans stay.
@@ -1224,50 +1441,97 @@ _SECRET_KEY = re.compile(
 )
 
 
-def _api_index() -> list[dict]:
-    """GET operations of the Dashboard API, from the organization's own OpenAPI spec (cached)."""
+def _index_file(org_id: str) -> Optional[pathlib.Path]:
+    """Where the operation index is kept between processes, or None when there is no cache directory."""
+    root = os.environ.get("XDG_CACHE_HOME") or (os.path.join(os.path.expanduser("~"), ".cache") if os.path.expanduser("~") != "~" else "")
+    if not root:
+        return None
+    base = os.environ.get("MERAKI_BASE_URL", "") or DEFAULT_BASE_URL
+    tag = hashlib.sha256(f"{base}|{org_id}".encode()).hexdigest()[:16]
+    return pathlib.Path(root) / "merakiadm-mcp" / f"api-index-{tag}.json"
 
-    def load():
-        spec = _get_client().get(f"/organizations/{_organizations()[0]['id']}/openapiSpec", {"version": 3}) or {}
-        ops = []
-        for path, methods in (spec.get("paths") or {}).items():
-            op = (methods or {}).get("get")
-            if not isinstance(op, dict):
+
+def _compile_ops(ops: list[dict]) -> list[dict]:
+    for op in ops:
+        op["regex"] = re.compile("^" + re.sub(r"\\\{[^/]+?\\\}", "[^/]+", re.escape(op["path"])) + "$")
+    return ops
+
+
+def _api_index(cached_only: bool = False) -> Optional[list[dict]]:
+    """GET operations of the Dashboard API, from the organization's own OpenAPI spec.
+
+    Kept in memory and in a cache file for API_INDEX_SECONDS, so a server
+    started per call (as an agent bridge does) reads the 4 MB spec only once
+    in a while. The cache file is best effort: when it cannot be read or
+    written the spec is fetched again. ``cached_only`` returns None instead
+    of fetching.
+    """
+    hit = _cache.get("api-index")
+    if hit and time.monotonic() - hit[0] < API_INDEX_SECONDS:
+        return hit[1]
+    org_id = str(_organizations()[0]["id"])
+    path = _index_file(org_id)
+    try:
+        if path and time.time() - path.stat().st_mtime < API_INDEX_SECONDS:
+            ops = _compile_ops(json.loads(path.read_text(encoding="utf-8")))
+            _cache["api-index"] = (time.monotonic(), ops)
+            return ops
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    if cached_only:
+        return None
+    ops = _load_api_index(org_id)
+    _cache["api-index"] = (time.monotonic(), ops)
+    if path:
+        try:
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            tmp = path.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps([{k: v for k, v in op.items() if k != "regex"} for op in ops]), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+    return ops
+
+
+def _load_api_index(org_id: str) -> list[dict]:
+    """Read the GET operations out of the organization's OpenAPI spec (about 4 MB)."""
+    spec = _get_client().get(f"/organizations/{org_id}/openapiSpec", {"version": 3}) or {}
+    ops = []
+    for path, methods in (spec.get("paths") or {}).items():
+        op = (methods or {}).get("get")
+        if not isinstance(op, dict):
+            continue
+        params = []
+        for prm in op.get("parameters") or []:
+            if not isinstance(prm, dict) or "name" not in prm:
                 continue
-            params = []
-            for prm in op.get("parameters") or []:
-                if not isinstance(prm, dict) or "name" not in prm:
-                    continue
-                schema = prm.get("schema") or {}
-                kind = schema.get("type") or ""
-                if kind == "array":
-                    kind = f"array of {(schema.get('items') or {}).get('type') or 'value'}"
-                params.append(
-                    {
-                        "name": prm["name"],
-                        "in": prm.get("in"),
-                        "required": bool(prm.get("required")),
-                        "type": kind,
-                        "enum": schema.get("enum") or (schema.get("items") or {}).get("enum"),
-                        "description": " ".join(str(prm.get("description") or "").split())[:200],
-                    }
-                )
-            ops.append(
+            schema = prm.get("schema") or {}
+            kind = schema.get("type") or ""
+            if kind == "array":
+                kind = f"array of {(schema.get('items') or {}).get('type') or 'value'}"
+            params.append(
                 {
-                    "id": op.get("operationId") or "",
-                    "path": path,
-                    "summary": " ".join(str(op.get("summary") or "").split()),
-                    "description": " ".join(str(op.get("description") or "").split())[:600],
-                    "tags": [str(t) for t in op.get("tags") or []],
-                    "params": params,
-                    "regex": re.compile("^" + re.sub(r"\\\{[^/]+?\\\}", "[^/]+", re.escape(path)) + "$"),
+                    "name": prm["name"],
+                    "in": prm.get("in"),
+                    "required": bool(prm.get("required")),
+                    "type": kind,
+                    "enum": schema.get("enum") or (schema.get("items") or {}).get("enum"),
+                    "description": " ".join(str(prm.get("description") or "").split())[:200],
                 }
             )
-        if not ops:
-            raise ToolError("the Dashboard returned no OpenAPI operations")
-        return ops
-
-    return _cached("api-index", load, API_INDEX_SECONDS)
+        ops.append(
+            {
+                "id": op.get("operationId") or "",
+                "path": path,
+                "summary": " ".join(str(op.get("summary") or "").split()),
+                "description": " ".join(str(op.get("description") or "").split())[:600],
+                "tags": [str(t) for t in op.get("tags") or []],
+                "params": params,
+            }
+        )
+    if not ops:
+        raise ToolError("the Dashboard returned no OpenAPI operations")
+    return _compile_ops(ops)
 
 
 def _words(text: str) -> set[str]:
@@ -1476,6 +1740,82 @@ def _shrink(node: Any, list_max: int, str_max: int, state: dict) -> Any:
     return node
 
 
+def _json_arg(value: Any, kind: type, name: str) -> Any:
+    """Accept an argument sent as a JSON-encoded string as well (some clients do that)."""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            value = json.loads(text)
+        except ValueError:
+            if kind is list:
+                return [f.strip() for f in text.split(",") if f.strip()]
+            raise ToolError(f"{name} must be a JSON object") from None
+    if value is not None and not isinstance(value, kind):
+        raise ToolError(f"{name} must be a JSON {'object' if kind is dict else 'array'}")
+    return value
+
+
+def _merge_pages(data: Any, more: Any) -> Any:
+    """Append the list of a following page to the first; None when the pages do not line up."""
+    if isinstance(data, list) and isinstance(more, list):
+        return data + more
+    if isinstance(data, dict) and isinstance(more, dict):
+        keys = [k for k, v in data.items() if isinstance(v, list)]
+        key = "items" if "items" in keys else (keys[0] if len(keys) == 1 else None)
+        if key and isinstance(more.get(key), list):
+            return {**data, key: data[key] + more[key]}
+    return None
+
+
+def _name_serials(node: Any) -> Any:
+    """Add a device name next to every serial of a device in scope.
+
+    ``serial`` gets ``deviceName``; another key ending in ``Serial`` (e.g.
+    ``recentDeviceSerial``) gets the same key ending in ``Name``.
+    """
+    serials: set[str] = set()
+
+    def collect(n: Any) -> None:
+        if isinstance(n, dict):
+            for k, v in n.items():
+                if _SERIAL_KEY.search(str(k)) and isinstance(v, str):
+                    serials.add(v)
+            for v in n.values():
+                collect(v)
+        elif isinstance(n, list):
+            for v in n:
+                collect(v)
+
+    collect(node)
+    if not serials:
+        return node
+    names: dict[str, str] = {}
+    for org in _organizations():
+        try:
+            names.update(_device_names(str(org["id"]))[0])
+        except MerakiAPIError:
+            pass
+
+    def add(n: Any) -> Any:
+        if isinstance(n, dict):
+            out = {k: add(v) for k, v in n.items()}
+            for k, v in n.items():
+                if not (_SERIAL_KEY.search(str(k)) and isinstance(v, str)):
+                    continue
+                name = names.get(v)
+                label = "deviceName" if k == "serial" else str(k)[:-6] + "Name"
+                if name and name != v and label not in out and out.get("name") != name:
+                    out[label] = name
+            return out
+        if isinstance(n, list):
+            return [add(v) for v in n]
+        return n
+
+    return add(node)
+
+
 def _size(node: Any) -> int:
     return len(json.dumps(node, ensure_ascii=False, default=str))
 
@@ -1483,11 +1823,12 @@ def _size(node: Any) -> int:
 @mcp.tool()
 def api_get(
     path: str,
-    params: Optional[dict[str, Any]] = None,
-    fields: Optional[list[str]] = None,
+    params: Optional[dict[str, Any] | str] = None,
+    fields: Optional[list[str] | str] = None,
     offset: int = 0,
     limit: int = 20,
     max_chars: int = API_MAX_CHARS,
+    max_pages: int = 1,
 ) -> dict:
     """Read any Dashboard API GET operation, bounded and with secrets masked.
 
@@ -1499,8 +1840,12 @@ def api_get(
     "device.name"), and the whole answer is shrunk to ``max_chars``: long
     nested lists and strings are cut and ``capped`` is set. Values of
     secret-looking keys (PSKs, RADIUS secrets, SNMP communities, passwords,
-    tokens, keys) are replaced with "[redacted]". ``next_params`` /
-    ``prev_params`` are the paging parameters to add for the next page.
+    tokens, keys) are replaced with "[redacted]". Every item that carries a
+    device ``serial`` also gets that device's ``deviceName``. ``next_params`` /
+    ``prev_params`` are the paging parameters to add for the next page;
+    ``max_pages`` reads up to 5 pages in one call and ``has_next_page`` says
+    whether more remain. ``observed_at`` (UTC) and ``operation`` say when and
+    what was read.
 
     Args:
         path: API path with its IDs filled in, e.g. /networks/N_123/wireless/ssids
@@ -1510,7 +1855,12 @@ def api_get(
         offset: First list item to return (default 0).
         limit: List items to return, 1-200 (default 20).
         max_chars: Size limit of the answer, 2000-60000 characters (default 20000).
+        max_pages: Pages to read by following next links, 1-5 (default 1).
     """
+    params = _json_arg(params, dict, "params")
+    fields = _json_arg(fields, list, "fields")
+    if isinstance(fields, list) and not all(isinstance(f, str) for f in fields):
+        raise ToolError("fields must be a list of key names")
     segments = _api_segments(path)
     query = _api_params(params)
     path = "/" + "/".join(segments)
@@ -1518,22 +1868,43 @@ def api_get(
     limit = _bound(limit, 1, 200)
     offset = max(0, int(offset or 0))
     max_chars = _bound(max_chars, 2000, 60000)
+    max_pages = _bound(max_pages, 1, API_MAX_PAGES)
+    observed_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    pages_read = 1
     if segments == ["organizations"]:
         data: Any = _organizations()
         page_links: dict = {}
     else:
         page = _get_client().page(path, query or None)
         data, page_links = page.data, page.links
+        started = time.monotonic()
+        while pages_read < max_pages and page_links.get("next") and time.monotonic() - started < API_PAGES_SECONDS:
+            nxt = page_links["next"]
+            follow = {**query, **nxt}
+            if "t0" in nxt or "t1" in nxt:
+                follow.pop("timespan", None)
+            more = _get_client().page(path, follow)
+            merged = _merge_pages(data, more.data)
+            if merged is None:
+                break
+            data, page_links, pages_read = merged, more.links, pages_read + 1
         if segments[0] == "organizations" and segments[2:] == ["networks"] and _env_list("MERAKI_NETWORK_IDS"):
             scope = set(_env_list("MERAKI_NETWORK_IDS"))
             data = [n for n in data or [] if isinstance(n, dict) and n.get("id") in scope]
     redacted = [0]
     data = _redact(data, redacted)
 
-    result: dict[str, Any] = {"path": path}
+    result: dict[str, Any] = {"path": path, "observed_at": observed_at}
+    index = _api_index(cached_only=True) if segments != ["organizations"] else None
+    op = next((o for o in index or [] if o["regex"].match(path)), None) if index else None
+    if op:
+        result["operation"] = op["id"]
     if query:
         result["params"] = _shrink(query, 20, 200, {})
+    if pages_read > 1 or max_pages > 1:
+        result["pages_read"] = pages_read
+    result["has_next_page"] = bool(page_links.get("next"))
     if redacted[0]:
         result["redacted"] = redacted[0]
     for rel in ("next", "prev"):
@@ -1555,8 +1926,11 @@ def api_get(
         window = items[offset : offset + limit]
         if fields:
             window = _project(window, fields)
-    elif fields:
-        data = _project(data, fields)
+        window = _name_serials(window)
+    else:
+        if fields:
+            data = _project(data, fields)
+        data = _name_serials(data)
 
     def build(rows: Any, extra: Any, list_max: int, str_max: int, state: dict) -> Any:
         if rows is None:
