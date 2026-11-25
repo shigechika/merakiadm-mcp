@@ -18,10 +18,12 @@ error）、`service`、`version`、`base_url`、`auth`（ok / error / missing-en
 | `failure_threshold` | 10.0 | WARNING にする接続失敗の割合（%） |
 | `top` | 5 | 項目ごとに挙げる名前の数（1〜20） |
 
-ネットワークごとに `[DEVICES]`、`[DEVICES-DOWN]`、`[HEALTH]`、`[CONNECT]` /
-`[CONNECT-HIGH-FAILURE]` と `[CONNECT-TOP-AP]`、`[SECURITY]`、`[UPLINK]` /
-`[UPLINK-DOWN]`、または `[API-ERROR]` を出し、CRITICAL（API のエラー）、
-WARNING（機器の停止、しきい値を超える失敗、セキュリティのイベント、
+ネットワークごとに `[DEVICES]`、`[DEVICES-DOWN]`、`[AVAILABILITY]`、`[HEALTH]`、
+`[CONNECT]` / `[CONNECT-HIGH-FAILURE]`（`hours` が 84 以下なら前の同じ長さの
+期間と比べる）と `[CONNECT-TOP-AP]`、`[SECURITY]`、`[OPERATIONS]` /
+`[OPERATIONS-WARN]`、`[UPLINK]` / `[UPLINK-DOWN]`、または `[API-ERROR]` を出し、
+CRITICAL（API のエラー）、WARNING（今または期間中の機器の停止、しきい値を
+超える失敗、セキュリティのイベント、警告に当たる運用のイベント、
 アップリンクの断）、OK に分けます。スイッチのポートは、アップリンクの印が
 付いたものだけを見ます。1 回に点検するのは 25 ネットワークまでで、残りは
 `capped` として数だけ示します。
@@ -36,6 +38,17 @@ WARNING（機器の停止、しきい値を超える失敗、セキュリティ�
 
 全体の成功率、段階・種類・SSID・VLAN 別の失敗、端末の数（数えるだけで
 一覧はしない）、失敗の多い AP とその段階、現地時刻の時間帯別の失敗。
+
+## availability_history
+
+| 引数 | 既定 | 範囲 |
+|---|---|---|
+| `network` | 対象が 1 つならそれ | 名前か ID |
+| `hours` | 24 | 1〜168 |
+| `top` | 20 | 機器の数（1〜100） |
+
+状態の変化の履歴から、online でなくなった機器ごとに、回数、期間内に
+online でなかった分数、最後の変化の時刻、まだ落ちているかを出します。
 
 ## air_marshal
 
@@ -63,6 +76,22 @@ WARNING（機器の停止、しきい値を超える失敗、セキュリティ�
 `client_ip6_lla_conflict`、`ra_blocked`、`loop_detected`、`stp_bpdu_guard`、
 `stp_root_guard`、`stp_loop_guard`。`192.0.0.0/29` の IP の重複
 （464XLAT / CLAT）は別に数えます。
+
+## operational_events
+
+| 引数 | 既定 | 範囲 |
+|---|---|---|
+| `network` | 対象が 1 つならそれ | 名前か ID |
+| `hours` | 24 | 1〜168 |
+| `top` | 20 | 明細を出す件数（1〜100） |
+| `event_types` | 下記 | イベントの種類の名前 |
+
+既定の区分：再起動・ファームウェア、RADIUS、DHCP、電波（DFS と自動の
+チャネル変更）、無線の攻撃、スイッチの機器、スイッチの設定、スイッチの
+ポート、ローミング、イベントの記録（`events_dropped2`：Dashboard が
+イベントを捨てたので、件数は下限）。`daily_brief` では、再起動、RADIUS の
+無応答、DHCP のプールの枯渇、攻撃、スイッチの機器・設定・ポートの障害を
+WARNING にし、レーダー、チャネル変更、取りこぼしは参考として出します。
 
 ## list_events
 

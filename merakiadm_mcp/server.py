@@ -37,10 +37,10 @@ from merakiadm_mcp.client import (
     parse_cursor,
 )
 
-#: Event types worth an administrator's attention: rogue or duplicate DHCP
-#: servers, spoofed or rogue access points, address conflicts, IPv6 RA guard,
-#: loops and spanning-tree guards. Read from GET /networks/{id}/events/eventTypes.
-NOTABLE_EVENT_TYPES = (
+#: Security event types: rogue or duplicate DHCP servers, spoofed or rogue
+#: access points, address conflicts, IPv6 RA guard, loops and spanning-tree
+#: guards. Names from GET /networks/{id}/events/eventTypes.
+SECURITY_EVENT_TYPES = (
     "multiple_dhcp_servers_detected",
     "rogue_dhcp",
     "dhcp_snoop_blocked",
@@ -56,11 +56,63 @@ NOTABLE_EVENT_TYPES = (
     "stp_root_guard",
     "stp_loop_guard",
 )
+#: Operational event types, by group: rare, actionable events (reboots,
+#: RADIUS or DHCP trouble, radar, wireless attacks, switch hardware and port
+#: faults, lost log entries). High-volume types (association, port up/down,
+#: per-client authentication) are left to connection_failures and list_events.
+OPERATIONAL_EVENT_GROUPS = {
+    "reboot/firmware": ("boot", "boot_ios_up", "boot_ios_down", "upgrade_transition"),
+    "RADIUS": (
+        "8021x_radius_timeout",
+        "radius_mab_timeout",
+        "radius_proxy_homeserver_dead",
+        "radius_proxy_homeserver_zombie",
+        "radius_proxy_tls_fail",
+    ),
+    "DHCP": ("dhcp_no_leases", "dhcp_problem"),
+    "radio": ("dfs_event", "auto_rf_channel_change", "ai_rrm_lite_auto_rf_channel_change", "sunray_auto_rf_channel_change", "noise_avoid_begin"),
+    "wireless attack": ("bcast_deauth_attack", "bcast_disassoc_attack", "packet_flood", "device_packet_flood"),
+    "switch hardware": ("psu_error", "psu_remove", "temp_critical", "memory_low", "diskspace_low", "stack_cable_state", "conn_state_change"),
+    "switch config": ("config_apply_failure", "config_apply_error", "config_startup_save_failure"),
+    "switch port": ("udld_alert", "pm_err_disable_monitor", "mac_flap_detected", "stp_port_role_change", "topology_changed"),
+    "roaming": ("l3roaming_set_anchor_fail", "l3roaming_lost_anchor"),
+    "event log": ("events_dropped2",),
+}
+OPERATIONAL_EVENT_TYPES = tuple(t for types in OPERATIONAL_EVENT_GROUPS.values() for t in types)
+_GROUP_OF = {t: g for g, types in OPERATIONAL_EVENT_GROUPS.items() for t in types}
+#: Operational types that raise a WARNING in daily_brief; the rest are informational.
+OPERATIONAL_WARN_TYPES = frozenset(
+    {
+        "boot",
+        "boot_ios_down",
+        "8021x_radius_timeout",
+        "radius_mab_timeout",
+        "radius_proxy_homeserver_dead",
+        "radius_proxy_homeserver_zombie",
+        "radius_proxy_tls_fail",
+        "dhcp_no_leases",
+        "bcast_deauth_attack",
+        "bcast_disassoc_attack",
+        "packet_flood",
+        "device_packet_flood",
+        "psu_error",
+        "psu_remove",
+        "temp_critical",
+        "memory_low",
+        "diskspace_low",
+        "config_apply_failure",
+        "config_apply_error",
+        "udld_alert",
+        "pm_err_disable_monitor",
+        "mac_flap_detected",
+        "l3roaming_set_anchor_fail",
+    }
+)
 EVENT_PRODUCT_TYPES = ("wireless", "switch", "appliance", "camera", "cellularGateway", "sensor")
 FAILURE_STEPS = ("assoc", "auth", "dhcp", "dns")
 MAX_HOURS = 168  # the failed-connection and connection-stats endpoints look back at most 7 days
 CACHE_SECONDS = 300
-MAX_BRIEF_NETWORKS = 25  # each network costs about six requests and a section of output
+MAX_BRIEF_NETWORKS = 25  # each network costs about ten requests and a section of output
 _EVENT_TYPE_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 #: RFC 7335 IPv4 Service Continuity Prefix: 464XLAT (CLAT) clients all use
 #: 192.0.0.2 on purpose, so a "conflict" on it is not a real duplicate.
@@ -271,9 +323,9 @@ def _iso_ago(hours: int) -> str:
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _event_types(event_types: Optional[list[str]]) -> list[str]:
+def _event_types(event_types: Optional[list[str]], default: tuple[str, ...] = SECURITY_EVENT_TYPES) -> list[str]:
     if not event_types:
-        return list(NOTABLE_EVENT_TYPES)
+        return list(default)
     bad = [t for t in event_types if not _EVENT_TYPE_RE.match(t)]
     if bad:
         raise ToolError(f"Invalid event type(s): {bad}")
@@ -309,6 +361,22 @@ def _read_events(net: dict, product_type: str, types: list[str], hours: int, per
     data = page.data or {}
     events = data.get("events") or []
     return events, len(events) >= per_page and "next" in page.links
+
+
+def _collect_events(net: dict, types: list[str], hours: int) -> tuple[list[dict], list[str]]:
+    """Events of ``types`` across the network's product types. Returns (events, capped product types)."""
+    collected: list[dict] = []
+    capped: list[str] = []
+    for product in [p for p in EVENT_PRODUCT_TYPES if p in (net.get("productTypes") or [])]:
+        events, more = _read_events(net, product, types, hours)
+        collected.extend(events)
+        if more:
+            capped.append(product)
+    return collected, capped
+
+
+def _capped_note(capped: list[str]) -> str:
+    return f" (capped: more {', '.join(capped)} events not read; shorten hours=)" if capped else ""
 
 
 def _event_line(ev: dict, tz: datetime.tzinfo, ssids: dict[int, str]) -> str:
@@ -388,8 +456,27 @@ def health_check() -> dict:
 # --------------------------------------------------------------------------
 
 
-def _connection_stats(net: dict, hours: int) -> dict:
-    return _get_client().get(f"/networks/{net['id']}/wireless/connectionStats", {"timespan": hours * 3600}) or {}
+def _connection_stats(net: dict, hours: int, offset_hours: int = 0) -> dict:
+    """Connection counts per step for the last ``hours``, or for the ``hours`` ending ``offset_hours`` ago."""
+    if not offset_hours:
+        params: dict[str, Any] = {"timespan": hours * 3600}
+    else:
+        params = {"t0": _iso_ago(offset_hours + hours), "t1": _iso_ago(offset_hours)}
+    return _get_client().get(f"/networks/{net['id']}/wireless/connectionStats", params) or {}
+
+
+def _trend(net: dict, hours: int, now_stats: dict) -> str:
+    """" (previous Nh: X% failed; biggest change: dhcp +N)" or "" when the window is too long to compare."""
+    if hours * 2 > MAX_HOURS:
+        return ""
+    prev = _connection_stats(net, hours, offset_hours=hours)
+    _, prev_pct = _success_line(prev)
+    if not any(prev.get(k) for k in (*FAILURE_STEPS, "success")):
+        return ""
+    deltas = {step: int(now_stats.get(step) or 0) - int(prev.get(step) or 0) for step in FAILURE_STEPS}
+    step, delta = max(deltas.items(), key=lambda kv: abs(kv[1]))
+    change = f"; biggest change: {step} {delta:+,}" if delta else ""
+    return f" (previous {hours}h: {prev_pct:.1f}% failed{change})"
 
 
 def _failed_connections(net: dict, hours: int) -> list[dict]:
@@ -430,7 +517,7 @@ def connection_failures(network: Optional[str] = None, hours: int = 24, top: int
     rows = _failed_connections(net, hours)
     summary, _ = _success_line(stats)
 
-    lines = [f"# Connection failures — {net.get('name')} (last {hours}h)", f"- Overall: {summary}"]
+    lines = [f"# Connection failures — {net.get('name')} (last {hours}h)", f"- Overall: {summary}{_trend(net, hours, stats)}"]
     if not rows:
         lines.append("- No failed connections recorded in this window.")
         return "\n".join(lines)
@@ -534,6 +621,14 @@ def air_marshal(network: Optional[str] = None, hours: int = 1, top: int = 20) ->
 # --------------------------------------------------------------------------
 
 
+def _newest(lines: list[str], events: list[dict], top: int, tz, ssids) -> None:
+    newest = sorted(events, key=lambda e: e.get("occurredAt") or "", reverse=True)
+    lines.append(f"\n## Newest {min(top, len(newest))} of {len(newest)}")
+    lines.extend(_event_line(e, tz, ssids) for e in newest[:top])
+    if len(newest) > top:
+        lines.append(f"- capped: {len(newest) - top} more not shown (raise top= or shorten hours=)")
+
+
 @mcp.tool()
 def security_events(
     network: Optional[str] = None,
@@ -563,31 +658,70 @@ def security_events(
     net = _one_network(network)
     hours = _bound(hours, 1, MAX_HOURS)
     top = _bound(top, 1, 100)
-    types = _event_types(event_types)
-    tz = _tz(net)
-    ssids = _ssid_names(net)
-    collected: list[dict] = []
-    capped: list[str] = []
-    for product in [p for p in EVENT_PRODUCT_TYPES if p in (net.get("productTypes") or [])]:
-        events, more = _read_events(net, product, types, hours)
-        collected.extend(events)
-        if more:
-            capped.append(product)
+    collected, capped = _collect_events(net, _event_types(event_types), hours)
     collected, clat = _split_clat(collected)
     counts = collections.Counter(e.get("type") for e in collected)
     lines = [
         f"# Security events — {net.get('name')} (last {hours}h)",
-        f"- Total: {len(collected):,}{' (capped: more exist for ' + ', '.join(capped) + ')' if capped else ''}",
+        f"- Total: {len(collected):,}{_capped_note(capped)}",
         f"- By type: {_top(counts, 20)}",
     ]
     if clat:
         lines.append(f"- Not counted: {clat:,} client_ip_conflict on {CLAT_PREFIX} (464XLAT/CLAT clients share 192.0.0.2 by design)")
     if collected:
-        newest = sorted(collected, key=lambda e: e.get("occurredAt") or "", reverse=True)
-        lines.append(f"\n## Newest {min(top, len(newest))} of {len(newest)}")
-        lines.extend(_event_line(e, tz, ssids) for e in newest[:top])
-        if len(newest) > top:
-            lines.append(f"- capped: {len(newest) - top} more not shown (raise top= or shorten hours=)")
+        _newest(lines, collected, top, _tz(net), _ssid_names(net))
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def operational_events(
+    network: Optional[str] = None,
+    hours: int = 24,
+    top: int = 20,
+    event_types: Optional[list[str]] = None,
+) -> str:
+    """List rare operational events: reboots, RADIUS/DHCP trouble, radar, attacks, switch faults, lost log entries.
+
+    By default reads, for every product type of the network, these groups:
+    reboot/firmware (boot, boot_ios_up, boot_ios_down, upgrade_transition),
+    RADIUS (8021x_radius_timeout, radius_mab_timeout,
+    radius_proxy_homeserver_dead / _zombie, radius_proxy_tls_fail),
+    DHCP (dhcp_no_leases, dhcp_problem), radio (dfs_event and automatic
+    channel changes, noise_avoid_begin), wireless attack (broadcast
+    deauth/disassoc attacks, packet floods), switch hardware (power supply,
+    temperature, memory, disk, stack cable, conn_state_change), switch config
+    (apply/save failures), switch port (UDLD, err-disable, MAC flap, STP role
+    and topology changes), roaming (L3 anchor failures) and event log
+    (events_dropped2: the Dashboard dropped events, so the log is incomplete).
+    Counts per group and type, then the newest ``top`` events in detail.
+    Use list_events for high-volume types (association, port status).
+
+    Args:
+        network: Network name or ID; may be omitted when only one is in scope.
+        hours: Look-back window, 1-168 (default 24).
+        top: How many events to show in detail (1-100, default 20).
+        event_types: Override the event types to read.
+    """
+    net = _one_network(network)
+    hours = _bound(hours, 1, MAX_HOURS)
+    top = _bound(top, 1, 100)
+    collected, capped = _collect_events(net, _event_types(event_types, OPERATIONAL_EVENT_TYPES), hours)
+    counts = collections.Counter(e.get("type") for e in collected)
+    groups: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
+    for etype, n in counts.items():
+        groups[_GROUP_OF.get(etype, "other")][etype] = n
+    lines = [
+        f"# Operational events — {net.get('name')} (last {hours}h)",
+        f"- Total: {len(collected):,}{_capped_note(capped)}",
+    ]
+    for group in [*OPERATIONAL_EVENT_GROUPS, "other"]:
+        if groups.get(group):
+            lines.append(f"- {group}: {_top(groups[group], 10)}")
+    if counts.get("events_dropped2"):
+        lines.append("- Note: events_dropped2 means the Dashboard dropped events; every event count above is a lower bound.")
+    collected = [e for e in collected if e.get("type") != "events_dropped2"]
+    if collected:
+        _newest(lines, collected, top, _tz(net), _ssid_names(net))
     return "\n".join(lines)
 
 
@@ -638,6 +772,101 @@ def list_events(
 
 
 # --------------------------------------------------------------------------
+# availability history
+# --------------------------------------------------------------------------
+
+
+def _status_of(change: dict, side: str) -> str:
+    for item in (change.get("details") or {}).get(side) or []:
+        if item.get("name") == "status":
+            return str(item.get("value"))
+    return "?"
+
+
+def _outages(net: dict, hours: int) -> tuple[list[dict], int, bool]:
+    """Per-device outages from the availability change history.
+
+    Returns (rows sorted worst first, number of changes, capped). A row has
+    name, product, downs (times the device left "online"), minutes down within
+    the window, last change and whether it is still down.
+    """
+    changes, capped = _get_client().get_all(
+        f"/organizations/{net['organizationId']}/devices/availabilities/changeHistory",
+        {"networkIds[]": [net["id"]], "timespan": hours * 3600, "perPage": 1000},
+        max_pages=5,
+    )
+    now = datetime.datetime.now(datetime.timezone.utc)
+    start = now - datetime.timedelta(hours=hours)
+    per: dict[str, dict] = {}
+    for change in sorted(changes, key=lambda c: c.get("ts") or ""):
+        device = change.get("device") or {}
+        key = device.get("serial") or device.get("name") or "?"
+        row = per.setdefault(
+            key,
+            {"name": device.get("name") or key, "product": device.get("productType") or "", "downs": 0, "seconds": 0.0, "down_since": None, "last": None},
+        )
+        try:
+            ts = datetime.datetime.fromisoformat(str(change.get("ts")).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        old, new = _status_of(change, "old"), _status_of(change, "new")
+        row["last"] = change.get("ts")
+        if new != "online" and row["down_since"] is None:
+            row["downs"] += 1
+            row["down_since"] = ts
+        elif new == "online":
+            began = row["down_since"] or (start if old != "online" else None)
+            if began is not None:
+                row["seconds"] += (ts - max(began, start)).total_seconds()
+            row["down_since"] = None
+    rows = []
+    for row in per.values():
+        if row["down_since"] is not None:
+            row["seconds"] += (now - max(row["down_since"], start)).total_seconds()
+        if row["downs"] or row["seconds"]:
+            rows.append({**row, "minutes": round(row["seconds"] / 60), "still_down": row["down_since"] is not None})
+    rows.sort(key=lambda r: (-r["downs"], -r["minutes"]))
+    return rows, len(changes), capped
+
+
+def _outage_text(row: dict, tz) -> str:
+    still = ", still down" if row["still_down"] else ""
+    return f"{row['name']} {row['downs']}x {row['minutes']} min (last change {_local(row['last'], tz)}{still})"
+
+
+@mcp.tool()
+def availability_history(network: Optional[str] = None, hours: int = 24, top: int = 20) -> str:
+    """Which devices went offline (or alerting / dormant) and came back, from the availability change history.
+
+    For each device that left "online" in the window: how many times, the
+    minutes it spent not online within the window, the time of its last
+    change and whether it is still down. Answers "it drops out sometimes"
+    questions that a point-in-time status cannot.
+
+    Args:
+        network: Network name or ID; may be omitted when only one is in scope.
+        hours: Look-back window, 1-168 (default 24).
+        top: How many devices to list (1-100, default 20).
+    """
+    net = _one_network(network)
+    hours = _bound(hours, 1, MAX_HOURS)
+    top = _bound(top, 1, 100)
+    tz = _tz(net)
+    rows, changes, capped = _outages(net, hours)
+    lines = [
+        f"# Availability history — {net.get('name')} (last {hours}h)",
+        f"- Status changes: {changes:,}{' (capped: more changes not read; shorten hours=)' if capped else ''}",
+        f"- Devices that left online: {len(rows):,}",
+    ]
+    if rows:
+        lines.append(f"\n## Devices ({min(top, len(rows))} of {len(rows)})")
+        lines.extend(f"- {_outage_text(r, tz)} [{r['product']}]" for r in rows[:top])
+        if len(rows) > top:
+            lines.append(f"- capped: {len(rows) - top} more devices not listed (raise top=)")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
 # switch uplinks
 # --------------------------------------------------------------------------
 
@@ -671,19 +900,27 @@ def _uplink_problems(switches: list[dict]) -> tuple[int, list[str]]:
 def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) -> str:
     """Morning health check of every network in scope.
 
-    Per network: device status (offline / alerting / dormant, by name), the
-    network's health alerts, the wireless connection success rate with
-    failures per step and the access points with the most failures,
-    security-relevant events (see security_events), and switch uplink ports
-    that are not connected.
+    Per network, for the last ``hours``:
+    - [DEVICES] current status counts, [DEVICES-DOWN] who is offline/alerting now
+    - [AVAILABILITY] devices that went offline and came back (see availability_history)
+    - [HEALTH] the network's current health alerts
+    - [CONNECT] wireless success rate, failures per step, the previous
+      window of the same length for comparison, and [CONNECT-TOP-AP] when
+      failures exceed ``failure_threshold``
+    - [SECURITY] security event counts (see security_events)
+    - [OPERATIONS] rare operational events: reboots, RADIUS/DHCP trouble,
+      radar, attacks, switch faults, dropped log entries (see operational_events)
+    - [UPLINK] switch ports flagged as uplinks that are not connected
 
     At most 25 networks are checked per call; the rest are counted as capped.
 
     Output tiers:
     - CRITICAL — the API could not be read for that network
-    - WARNING  — a device offline or alerting, connection failures above
-                 ``failure_threshold`` percent, any security event, or an
-                 uplink down
+    - WARNING  — a device offline or alerting now or during the window,
+                 connection failures above ``failure_threshold`` percent,
+                 any security event, a warning-level operational event
+                 (reboot, RADIUS timeout, DHCP pool exhausted, attack,
+                 hardware or port fault), or an uplink down
     - OK       — none of the above
 
     Args:
@@ -723,6 +960,18 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
                 more = f" … capped: {len(down) - top} more" if len(down) > top else ""
                 body.append(f"- [DEVICES-DOWN] {listed}{more}")
 
+            outages, changes, outage_capped = _outages(net, hours)
+            if outages:
+                tier = "WARNING"
+                body.append(
+                    f"- [AVAILABILITY] {len(outages)} device(s) left online: "
+                    + "; ".join(_outage_text(r, _tz(net)) for r in outages[:top])
+                    + (f" … capped: {len(outages) - top} more" if len(outages) > top else "")
+                    + (" (capped: more changes not read)" if outage_capped else "")
+                )
+            else:
+                body.append(f"- [AVAILABILITY] no device left online ({changes} status changes)")
+
             alerts = _get_client().get(f"/networks/{net['id']}/health/alerts") or []
             if alerts:
                 body.append(
@@ -732,29 +981,34 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
                 )
 
             if "wireless" in products:
-                summary, pct = _success_line(_connection_stats(net, hours))
+                stats = _connection_stats(net, hours)
+                summary, pct = _success_line(stats)
                 flag = pct > failure_threshold
                 tier = "WARNING" if flag else tier
-                body.append(f"- [CONNECT{'-HIGH-FAILURE' if flag else ''}] {summary}")
+                body.append(f"- [CONNECT{'-HIGH-FAILURE' if flag else ''}] {summary}{_trend(net, hours, stats)}")
                 if flag:
                     names, names_capped = _device_names(org_id)
                     per_ap = collections.Counter(names.get(r.get("serial"), r.get("serial")) for r in _failed_connections(net, hours))
                     body.append(f"- [CONNECT-TOP-AP] {_top(per_ap, top)}{' (' + NAMES_CAPPED + ')' if names_capped else ''}")
 
-            types = list(NOTABLE_EVENT_TYPES)
-            counts: collections.Counter = collections.Counter()
-            capped = []
-            for product in [p for p in EVENT_PRODUCT_TYPES if p in products]:
-                events, more = _read_events(net, product, types, hours)
-                counts.update(e.get("type") for e in _split_clat(events)[0])
-                if more:
-                    capped.append(product)
-            more_note = f" (capped: more {', '.join(capped)} events not read)" if capped else ""
+            events, capped = _collect_events(net, list(SECURITY_EVENT_TYPES), hours)
+            counts = collections.Counter(e.get("type") for e in _split_clat(events)[0])
             if counts:
                 tier = "WARNING"
-                body.append(f"- [SECURITY] {_top(counts, 20)}{more_note} — see security_events")
+                body.append(f"- [SECURITY] {_top(counts, 20)}{_capped_note(capped)} — see security_events")
             else:
-                body.append(f"- [SECURITY] none{more_note}")
+                body.append(f"- [SECURITY] none{_capped_note(capped)}")
+
+            events, capped = _collect_events(net, list(OPERATIONAL_EVENT_TYPES), hours)
+            ops = collections.Counter(e.get("type") for e in events)
+            warn = collections.Counter({t: n for t, n in ops.items() if t in OPERATIONAL_WARN_TYPES})
+            info = collections.Counter({t: n for t, n in ops.items() if t not in OPERATIONAL_WARN_TYPES})
+            if warn:
+                tier = "WARNING"
+                body.append(f"- [OPERATIONS-WARN] {_top(warn, 20)}{_capped_note(capped)} — see operational_events")
+            if info or not warn:
+                dropped = " (events_dropped2: the Dashboard dropped events, counts are lower bounds)" if ops.get("events_dropped2") else ""
+                body.append(f"- [OPERATIONS] {_top(info, 20)}{'' if warn else _capped_note(capped)}{dropped}")
 
             if "switch" in products:
                 switches, more = _switch_ports(org_id, [net["id"]])

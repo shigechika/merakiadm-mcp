@@ -161,7 +161,7 @@ def test_security_events_marks_capped_pages():
         return_value=httpx.Response(200, json={"events": events}, headers={"Link": f"<{BASE}/networks/N_1/events?startingAfter=z>; rel=next"})
     )
     text = server.security_events(hours=24, top=2)
-    assert "capped: more exist for wireless, switch" in text
+    assert "capped: more wireless, switch events not read" in text
     assert "capped: 1998 more not shown" in text
 
 
@@ -218,15 +218,31 @@ def test_several_networks_need_a_name():
         server._one_network("nope")
 
 
-def daily_routes(stats, events=(), ports=None, avail=None):
+def events_by_kind(security=(), operational=(), headers=None):
+    """An events route answering by which default type list was asked for."""
+
+    def answer(request):
+        asked = request.url.params.get_list("includedEventTypes[]")
+        body = list(operational) if "boot" in asked else list(security)
+        return httpx.Response(200, json={"events": body}, headers=headers or {})
+
+    return answer
+
+
+def daily_routes(stats, events=(), ports=None, avail=None, changes=(), ops=(), prev=None):
     base_routes()
+    respx.get(f"{BASE}/organizations/100/devices/availabilities/changeHistory").mock(
+        return_value=httpx.Response(200, json=list(changes))
+    )
     respx.get(f"{BASE}/organizations/100/devices/availabilities").mock(
         return_value=httpx.Response(200, json=avail if avail is not None else [{"name": d["name"], "serial": d["serial"], "status": "online"} for d in DEVICES])
     )
     respx.get(f"{BASE}/networks/N_1/health/alerts").mock(return_value=httpx.Response(200, json=[]))
-    respx.get(f"{BASE}/networks/N_1/wireless/connectionStats").mock(return_value=httpx.Response(200, json=stats))
+    respx.get(f"{BASE}/networks/N_1/wireless/connectionStats").mock(
+        side_effect=lambda request: httpx.Response(200, json=(prev or {}) if "t0" in request.url.params else stats)
+    )
     respx.get(f"{BASE}/networks/N_1/wireless/failedConnections").mock(return_value=httpx.Response(200, json=failed_rows()))
-    respx.get(f"{BASE}/networks/N_1/events").mock(return_value=httpx.Response(200, json={"events": list(events)}))
+    respx.get(f"{BASE}/networks/N_1/events").mock(side_effect=events_by_kind(events, ops))
     respx.get(f"{BASE}/organizations/100/switch/ports/statuses/bySwitch").mock(
         return_value=httpx.Response(200, json={"items": ports if ports is not None else [{"name": "sw-1", "ports": [{"portId": "49", "isUplink": True, "status": "Connected", "enabled": True}]}], "meta": {}})
     )
@@ -238,7 +254,9 @@ def test_daily_brief_ok():
     text = server.daily_brief(hours=24, failure_threshold=10.0, top=3)
     assert text.startswith("## daily_brief — ")
     assert "1 networks: 1 OK, 0 WARNING, 0 CRITICAL" in text
+    assert "[AVAILABILITY] no device left online (0 status changes)" in text
     assert "[SECURITY] none" in text
+    assert "[OPERATIONS] none" in text
     assert "[UPLINK] 1 switches, 1 uplink ports, none down" in text
 
 
@@ -309,7 +327,88 @@ def test_daily_brief_says_when_security_pages_were_left_unread():
     daily_routes({"success": 10})
     clat = {"type": "client_ip_conflict", "eventData": {"ip": "192.0.0.2"}}
     respx.get(f"{BASE}/networks/N_1/events").mock(
-        return_value=httpx.Response(200, json={"events": [clat] * 1000}, headers={"Link": f"<{BASE}/networks/N_1/events?startingAfter=z>; rel=next"})
+        side_effect=events_by_kind([clat] * 1000, headers={"Link": f"<{BASE}/networks/N_1/events?startingAfter=z>; rel=next"})
     )
     text = server.daily_brief(hours=24, failure_threshold=10.0, top=3)
-    assert "[SECURITY] none (capped: more wireless, switch events not read)" in text
+    assert "[SECURITY] none (capped: more wireless, switch events not read" in text
+
+
+def change(serial, name, ts, old, new):
+    return {
+        "ts": ts,
+        "device": {"serial": serial, "name": name, "productType": "wireless"},
+        "details": {"old": [{"name": "status", "value": old}], "new": [{"name": "status", "value": new}]},
+    }
+
+
+def _recent(minutes_ago):
+    import datetime
+
+    moment = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=minutes_ago)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@respx.mock
+def test_availability_history_pairs_outages():
+    base_routes()
+    respx.get(f"{BASE}/organizations/100/devices/availabilities/changeHistory").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                change("Q-AP1", "ap-1", _recent(120), "online", "offline"),
+                change("Q-AP1", "ap-1", _recent(110), "offline", "online"),
+                change("Q-AP1", "ap-1", _recent(60), "online", "offline"),
+                change("Q-AP1", "ap-1", _recent(55), "offline", "online"),
+                change("Q-AP2", "ap-2", _recent(30), "online", "offline"),
+            ],
+        )
+    )
+    text = server.availability_history(hours=24, top=5)
+    assert "- Status changes: 5" in text
+    assert "- Devices that left online: 2" in text
+    assert "- ap-1 2x 15 min" in text
+    assert "ap-2 1x 30 min" in text and "still down" in text
+
+
+@respx.mock
+def test_operational_events_groups_and_flags_dropped_entries():
+    base_routes()
+    ops = [
+        {"occurredAt": "2026-11-25T08:00:00Z", "type": "boot", "deviceName": "ap-1"},
+        {"occurredAt": "2026-11-25T08:01:00Z", "type": "dfs_event", "deviceName": "ap-2"},
+        {"occurredAt": "2026-11-25T08:02:00Z", "type": "events_dropped2"},
+    ]
+    route = respx.get(f"{BASE}/networks/N_1/events").mock(side_effect=events_by_kind(operational=ops))
+    text = server.operational_events(hours=24, top=5)
+    assert "- reboot/firmware: boot 2" in text  # one per product type queried
+    assert "- radio: dfs_event 2" in text
+    assert "- event log: events_dropped2 2" in text
+    assert "lower bound" in text
+    assert "events_dropped2" not in text.split("## Newest", 1)[1]
+    assert "8021x_radius_timeout" in route.calls[0].request.url.params.get_list("includedEventTypes[]")
+
+
+@respx.mock
+def test_daily_brief_reports_outages_operations_and_trend():
+    daily_routes(
+        {"assoc": 0, "auth": 1, "dhcp": 9, "dns": 0, "success": 90},
+        prev={"assoc": 0, "auth": 1, "dhcp": 2, "dns": 0, "success": 97},
+        changes=[change("Q-AP1", "ap-1", _recent(30), "online", "offline"), change("Q-AP1", "ap-1", _recent(20), "offline", "online")],
+        ops=[{"type": "8021x_radius_timeout"}, {"type": "dfs_event"}, {"type": "events_dropped2"}],
+    )
+    text = server.daily_brief(hours=24, failure_threshold=50.0, top=3)
+    assert "0 OK, 1 WARNING" in text
+    assert "[AVAILABILITY] 1 device(s) left online: ap-1 1x 10 min" in text
+    assert "(previous 24h: 3.0% failed; biggest change: dhcp +7)" in text
+    assert "[OPERATIONS-WARN] 8021x_radius_timeout 2" in text
+    assert "[OPERATIONS] dfs_event 2, events_dropped2 2 (events_dropped2:" in text
+
+
+@respx.mock
+def test_long_windows_skip_the_comparison():
+    base_routes()
+    stats = respx.get(f"{BASE}/networks/N_1/wireless/connectionStats").mock(return_value=httpx.Response(200, json={"success": 1}))
+    respx.get(f"{BASE}/networks/N_1/wireless/failedConnections").mock(return_value=httpx.Response(200, json=[]))
+    text = server.connection_failures(hours=100, top=3)
+    assert "previous" not in text
+    assert all("t0" not in c.request.url.params for c in stats.calls)

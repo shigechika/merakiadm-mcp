@@ -26,9 +26,11 @@ Cisco Meraki Dashboard の管理者向けの、読み取り専用の MCP サー�
 | ツール | 答えること |
 |---|---|
 | `health_check` | 版、API キーが効くか、対象の組織とネットワーク、状態別の機器の台数 |
-| `daily_brief` | 全ネットワークの朝の点検を 1 回で：オフラインや警告の機器、健康アラート、接続の成功率、セキュリティのイベント、スイッチのアップリンク。CRITICAL / WARNING / OK に分ける |
+| `daily_brief` | 全ネットワークの直近 24 時間の点検を 1 回で：今と期間中に落ちた機器、健康アラート、接続の成功率（前の同じ長さの期間と比較）、セキュリティと運用のイベント、スイッチのアップリンク。CRITICAL / WARNING / OK に分ける |
 | `connection_failures` | 無線の接続失敗を段階（assoc / auth / dhcp / dns）・種類・SSID・VLAN・AP・時間帯で集計 |
 | `air_marshal` | 周りの SSID：総数、自分の有線 LAN で見えた SSID（野良 AP）、自分の SSID 名を名乗る SSID |
+| `availability_history` | オフライン（または警告・休止）になって戻った機器：回数、時間、まだ落ちているか |
+| `operational_events` | まれな運用のイベント：再起動、RADIUS の無応答、DHCP のプールの枯渇、レーダー、無線の攻撃、スイッチの機器・設定・ポートの障害、イベントの取りこぼし |
 | `security_events` | 野良や重複の DHCP サーバ、AP のなりすまし、野良 AP への関連付け、IP・IPv6 の重複、RA Guard、ループ、STP のガード |
 | `list_events` | イベントの記録を 1 ページずつ。続きを読む `older_cursor` と、読み切ったかの `complete` を返す |
 

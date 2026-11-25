@@ -71,6 +71,19 @@ PROBES: dict[str, Probe] = {
         must_not_match=NO_ERROR,
         timeout=120,
     ),
+    "operational_events": Probe(
+        args_factory=_single_network,
+        args={"hours": 24, "top": 3},
+        must_match=(r"^# Operational events — ",),
+        must_not_match=NO_ERROR,
+        timeout=120,
+    ),
+    "availability_history": Probe(
+        args_factory=_single_network,
+        args={"hours": 24, "top": 3},
+        must_match=(r"^# Availability history — ",),
+        must_not_match=NO_ERROR,
+    ),
     "list_events": Probe(
         args_factory=_single_network,
         args={"product_type": "wireless", "per_page": 5},
