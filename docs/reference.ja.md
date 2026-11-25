@@ -21,7 +21,7 @@ error）、`service`、`version`、`base_url`、`auth`（ok / error / missing-en
 ネットワークごとに `[DEVICES]`、`[DEVICES-DOWN]`、`[AVAILABILITY]`、`[HEALTH]`、
 `[CONNECT]` / `[CONNECT-HIGH-FAILURE]`（`hours` が 84 以下なら前の同じ長さの
 期間と比べる）と `[CONNECT-TOP-AP]`、`[SECURITY]`、`[OPERATIONS]` /
-`[OPERATIONS-WARN]`、`[UPLINK]` / `[UPLINK-DOWN]`、または `[API-ERROR]` を出し、
+`[OPERATIONS-WARN]`、`[LOG-DROPPED]`、`[UPLINK]` / `[UPLINK-DOWN]`、または `[API-ERROR]` を出し、
 CRITICAL（API のエラー）、WARNING（今または期間中の機器の停止、しきい値を
 超える失敗、セキュリティのイベント、警告に当たる運用のイベント、
 アップリンクの断）、OK に分けます。スイッチのポートは、アップリンクの印が
@@ -90,8 +90,9 @@ online から落ちた回数、期間内に online でなかった分数、期�
 
 既定の区分：再起動・ファームウェア、RADIUS、DHCP、電波（DFS と自動の
 チャネル変更）、無線の攻撃、スイッチの機器、スイッチの設定、スイッチの
-ポート、ローミング、イベントの記録（`events_dropped2`：Dashboard が
-イベントを捨てたので、件数は下限）。`daily_brief` では、再起動、RADIUS の
+ポート、ローミング、イベントの記録（`events_dropped2`：AP が association
+などの大量に出る種類のイベントを `n` 件間引いた記録。種類ごとに合計し、
+`daily_brief` では `[LOG-DROPPED]` として出す）。`daily_brief` では、再起動、RADIUS の
 無応答、DHCP のプールの枯渇、攻撃、スイッチの機器・設定・ポートの障害を
 WARNING にし、レーダー、チャネル変更、取りこぼしは参考として出します。
 
@@ -102,7 +103,7 @@ WARNING にし、レーダー、チャネル変更、取りこぼしは参考と
 | `product_type` | 必須 | wireless、switch、appliance、camera、cellularGateway、sensor |
 | `network` | 対象が 1 つならそれ | 名前か ID |
 | `event_types` | すべて | イベントの種類の名前 |
-| `per_page` | 50 | 1〜100 |
+| `per_page` | 50 | 3〜100 |
 | `cursor` | 最新のページ | 前の答えの `older_cursor` |
 
 最後に `older_cursor` と `complete` を出します。

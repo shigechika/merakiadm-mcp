@@ -40,11 +40,19 @@ MERAKI_DASHBOARD_API_KEY=... .venv/bin/python scripts/smoke_test.py   # live smo
 ## Rules
 
 - **Bounded output.** Air Marshal, failed connections and events are huge at
-  a busy site (measured: an hour of Air Marshal ~1,300 SSIDs / 570 KB, a day
-  of failed connections ~2,000 rows / 385 KB, a day of wireless events
-  ~50,000). A tool aggregates server-side, takes `hours` and `top` /
+  a busy site (an hour of Air Marshal can be over a thousand SSIDs and
+  hundreds of KB, a day of failed connections thousands of rows, a day of
+  wireless events tens of thousands). A tool aggregates server-side, takes `hours` and `top` /
   `per_page` bounds clamped by `_bound`, and says `capped` when it dropped
   anything. Never add a tool that returns a raw list.
+- Events are read newest page first (no `startingAfter`, which answers
+  oldest first) and trimmed to the window, so a capped read loses the oldest
+  events of the window, never the newest. The events endpoint refuses
+  `perPage` below 3. Availability change history answers newest first and
+  its `next` link pins `t0`/`t1`; `get_all` drops `timespan` then.
+- `events_dropped2` is an access point reporting it dropped `n` events of a
+  high-volume type (`eventData.type`); it is reported as `[LOG-DROPPED]`,
+  never as an operational event.
 - IP conflicts on `192.0.0.0/29` (464XLAT/CLAT, RFC 7335) are counted apart
   (`_split_clat`) and never raise a WARNING.
 - Public repository: English in code, comments, commits and docs (plus the

@@ -121,3 +121,15 @@ def test_redirect_without_location_is_refused():
     respx.get(f"{BASE}/organizations").mock(return_value=httpx.Response(302))
     with pytest.raises(MerakiAPIError, match="without a Location"):
         make().get("/organizations")
+
+
+@respx.mock
+def test_get_all_drops_timespan_when_the_link_pins_the_window():
+    nxt = f'<{BASE}/h?endingBefore=2&t0=1&t1=3>; rel=next'
+    route = respx.get(f"{BASE}/h").mock(
+        side_effect=[httpx.Response(200, json=[1], headers={"Link": nxt}), httpx.Response(200, json=[2])]
+    )
+    items, capped = make().get_all("/h", {"timespan": 3600, "perPage": 1})
+    assert items == [1, 2] and capped is False
+    second = route.calls[1].request.url.params
+    assert "timespan" not in second and second["t0"] == "1" and second["endingBefore"] == "2"

@@ -177,7 +177,11 @@ class MerakiClient:
             nxt = page.links.get("next")
             if not nxt:
                 return items, False
-            query = {**(params or {}), **nxt}
+            base = dict(params or {})
+            if "t0" in nxt or "t1" in nxt:
+                # The link pins the window itself; sending timespan too is a 400.
+                base.pop("timespan", None)
+            query = {**base, **nxt}
         return items, True
 
 

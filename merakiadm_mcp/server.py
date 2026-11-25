@@ -113,6 +113,7 @@ FAILURE_STEPS = ("assoc", "auth", "dhcp", "dns")
 MAX_HOURS = 168  # the failed-connection and connection-stats endpoints look back at most 7 days
 CACHE_SECONDS = 300
 MAX_BRIEF_NETWORKS = 25  # each network costs about ten requests and a section of output
+BRIEF_TIME_BUDGET = 40.0  # seconds; networks not started by then are reported as capped
 _EVENT_TYPE_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 #: RFC 7335 IPv4 Service Continuity Prefix: 464XLAT (CLAT) clients all use
 #: 192.0.0.2 on purpose, so a "conflict" on it is not a real duplicate.
@@ -347,20 +348,31 @@ def _split_clat(events: list[dict]) -> tuple[list[dict], int]:
     return kept, len(events) - len(kept)
 
 
+def _parse_ts(value: Any) -> Optional[datetime.datetime]:
+    try:
+        moment = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=datetime.timezone.utc)
+
+
 def _read_events(net: dict, product_type: str, types: list[str], hours: int, per_page: int = 1000):
-    """Events of ``types`` in the last ``hours`` (one page). Returns (events, capped)."""
+    """The newest page of ``types``, kept to the last ``hours``. Returns (events, capped).
+
+    Without a start the endpoint answers newest first, so when the page is full
+    the events left unread are the oldest of the window, not the newest
+    (``startingAfter`` would answer oldest first and lose the newest instead).
+    """
     page = _get_client().page(
         f"/networks/{net['id']}/events",
-        {
-            "productType": product_type,
-            "includedEventTypes[]": types,
-            "startingAfter": _iso_ago(hours),
-            "perPage": per_page,
-        },
+        {"productType": product_type, "includedEventTypes[]": types, "perPage": per_page},
     )
     data = page.data or {}
     events = data.get("events") or []
-    return events, len(events) >= per_page and "next" in page.links
+    start = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
+    kept = [e for e in events if (_parse_ts(e.get("occurredAt")) or start) >= start]
+    capped = len(events) >= per_page and len(kept) == len(events) and "prev" in page.links
+    return kept, capped
 
 
 def _collect_events(net: dict, types: list[str], hours: int) -> tuple[list[dict], list[str]]:
@@ -376,7 +388,39 @@ def _collect_events(net: dict, types: list[str], hours: int) -> tuple[list[dict]
 
 
 def _capped_note(capped: list[str]) -> str:
-    return f" (capped: more {', '.join(capped)} events not read; shorten hours=)" if capped else ""
+    return f" (capped: older {', '.join(capped)} events in the window not read; shorten hours=)" if capped else ""
+
+
+def _type_summary(events: list[dict], n: int = 20) -> str:
+    """'type N (c clients, d devices)' per type, most frequent first."""
+    by_type: dict[str, list[dict]] = collections.defaultdict(list)
+    for e in events:
+        by_type[e.get("type") or "?"].append(e)
+    ranked = sorted(by_type.items(), key=lambda kv: -len(kv[1]))
+    parts = []
+    for etype, rows in ranked[:n]:
+        clients = len({e.get("clientMac") for e in rows if e.get("clientMac")})
+        devices = len({e.get("deviceSerial") or e.get("deviceName") for e in rows if e.get("deviceSerial") or e.get("deviceName")})
+        who = ", ".join(x for x in (f"{clients} clients" if clients else "", f"{devices} devices" if devices else "") if x)
+        parts.append(f"{etype} {len(rows):,}" + (f" ({who})" if who else ""))
+    if len(ranked) > n:
+        parts.append(f"+{len(ranked) - n} more")
+    return ", ".join(parts) or "none"
+
+
+def _dropped_summary(events: list[dict]) -> str:
+    """What the access points dropped, from events_dropped2 entries (eventData n and type)."""
+    dropped: collections.Counter = collections.Counter()
+    for e in events:
+        if e.get("type") != "events_dropped2":
+            continue
+        data = e.get("eventData") or {}
+        kind = str(data.get("type") or "unspecified type")
+        try:
+            dropped[kind] += int(data.get("n") or 1)
+        except (TypeError, ValueError):
+            dropped[kind] += 1
+    return _top(dropped, 8) if dropped else ""
 
 
 def _event_line(ev: dict, tz: datetime.tzinfo, ssids: dict[int, str]) -> str:
@@ -660,11 +704,10 @@ def security_events(
     top = _bound(top, 1, 100)
     collected, capped = _collect_events(net, _event_types(event_types), hours)
     collected, clat = _split_clat(collected)
-    counts = collections.Counter(e.get("type") for e in collected)
     lines = [
         f"# Security events — {net.get('name')} (last {hours}h)",
         f"- Total: {len(collected):,}{_capped_note(capped)}",
-        f"- By type: {_top(counts, 20)}",
+        f"- By type: {_type_summary(collected)}",
     ]
     if clat:
         lines.append(f"- Not counted: {clat:,} client_ip_conflict on {CLAT_PREFIX} (464XLAT/CLAT clients share 192.0.0.2 by design)")
@@ -692,7 +735,8 @@ def operational_events(
     temperature, memory, disk, stack cable, conn_state_change), switch config
     (apply/save failures), switch port (UDLD, err-disable, MAC flap, STP role
     and topology changes), roaming (L3 anchor failures) and event log
-    (events_dropped2: the Dashboard dropped events, so the log is incomplete).
+    (events_dropped2: an access point dropped ``n`` events of a high-volume
+    type such as association, so the log is incomplete for that type).
     Counts per group and type, then the newest ``top`` events in detail;
     events_dropped2 entries are counted but not listed.
     Use list_events for high-volume types (association, port status).
@@ -718,8 +762,12 @@ def operational_events(
     for group in [*OPERATIONAL_EVENT_GROUPS, "other"]:
         if groups.get(group):
             lines.append(f"- {group}: {_top(groups[group], 10)}")
-    if counts.get("events_dropped2"):
-        lines.append("- Note: events_dropped2 means the Dashboard dropped events; every event count above is a lower bound.")
+    dropped = _dropped_summary(collected)
+    if dropped:
+        lines.append(
+            f"- Dropped by the access points (events_dropped2, events per type): {dropped}. "
+            "These are high-volume types; the log is incomplete for them."
+        )
     collected = [e for e in collected if e.get("type") != "events_dropped2"]
     if collected:
         _newest(lines, collected, top, _tz(net), _ssid_names(net))
@@ -739,19 +787,21 @@ def list_events(
     A busy wireless network logs tens of thousands of events a day, so read
     one page at a time and narrow with ``event_types`` where possible. The
     answer ends with ``older_cursor`` (pass it back as ``cursor`` for the
-    previous page) and ``complete`` (true when no older page exists).
+    previous page) and ``complete`` (false while the API still offers an
+    older page; pages are cut by time, so an empty page does not mean the
+    log ends there).
 
     Args:
         product_type: wireless, switch, appliance, camera, cellularGateway or sensor.
         network: Network name or ID; may be omitted when only one is in scope.
         event_types: Only these event types (names from the Dashboard's event type list).
-        per_page: Events per page, 1-100 (default 50).
+        per_page: Events per page, 3-100 (default 50).
         cursor: ``older_cursor`` from a previous answer.
     """
     if product_type not in EVENT_PRODUCT_TYPES:
         raise ToolError(f"product_type must be one of {', '.join(EVENT_PRODUCT_TYPES)}")
     net = _one_network(network)
-    per_page = _bound(per_page, 1, 100)
+    per_page = _bound(per_page, 3, 100)  # the events endpoint refuses perPage below 3
     params: dict[str, Any] = {"productType": product_type, "perPage": per_page}
     if event_types:
         params["includedEventTypes[]"] = _event_types(event_types)
@@ -768,7 +818,7 @@ def list_events(
     ]
     lines.extend(_event_line(e, tz, ssids) for e in sorted(events, key=lambda e: e.get("occurredAt") or "", reverse=True))
     lines.append(f"\nolder_cursor: {older or '-'}")
-    lines.append(f"complete: {'false' if older and events else 'true'}")
+    lines.append(f"complete: {'false' if older else 'true'}")
     return "\n".join(lines)
 
 
@@ -932,7 +982,8 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
       radar, attacks, switch faults, dropped log entries (see operational_events)
     - [UPLINK] switch ports flagged as uplinks that are not connected
 
-    At most 25 networks are checked per call; the rest are counted as capped.
+    At most 25 networks, and only those started within 40 seconds, are
+    checked per call; the rest are counted as capped.
 
     Output tiers:
     - CRITICAL — the API could not be read for that network
@@ -959,7 +1010,11 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
     nets = nets[:MAX_BRIEF_NETWORKS]
 
     sections: list[tuple[str, list[str]]] = []
-    for net in nets:
+    started = time.monotonic()
+    for index, net in enumerate(nets):
+        if index and time.monotonic() - started > BRIEF_TIME_BUDGET:
+            skipped = nets[index:] + skipped
+            break
         tier, body = "OK", []
         org_id = net["organizationId"]
         products = net.get("productTypes") or []
@@ -1017,20 +1072,22 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
             counts = collections.Counter(e.get("type") for e in _split_clat(events)[0])
             if counts:
                 tier = "WARNING"
-                body.append(f"- [SECURITY] {_top(counts, 20)}{_capped_note(capped)} — see security_events")
+                body.append(f"- [SECURITY] {_type_summary(_split_clat(events)[0])}{_capped_note(capped)} — see security_events")
             else:
                 body.append(f"- [SECURITY] none{_capped_note(capped)}")
 
             events, capped = _collect_events(net, list(OPERATIONAL_EVENT_TYPES), hours)
-            ops = collections.Counter(e.get("type") for e in events)
+            ops = collections.Counter(e.get("type") for e in events if e.get("type") != "events_dropped2")
             warn = collections.Counter({t: n for t, n in ops.items() if t in OPERATIONAL_WARN_TYPES})
             info = collections.Counter({t: n for t, n in ops.items() if t not in OPERATIONAL_WARN_TYPES})
             if warn:
                 tier = "WARNING"
                 body.append(f"- [OPERATIONS-WARN] {_top(warn, 20)}{_capped_note(capped)} — see operational_events")
             if info or not warn:
-                dropped = " (events_dropped2: the Dashboard dropped events, counts are lower bounds)" if ops.get("events_dropped2") else ""
-                body.append(f"- [OPERATIONS] {_top(info, 20)}{'' if warn else _capped_note(capped)}{dropped}")
+                body.append(f"- [OPERATIONS] {_top(info, 20)}{'' if warn else _capped_note(capped)}")
+            dropped = _dropped_summary(events)
+            if dropped:
+                body.append(f"- [LOG-DROPPED] access points dropped high-volume events: {dropped}")
 
             if "switch" in products:
                 switches, more = _switch_ports(org_id, [net["id"]])
@@ -1063,8 +1120,8 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
         lines.append("")
     if skipped:
         lines.append(
-            f"capped: {len(skipped)} more networks not checked (at most {MAX_BRIEF_NETWORKS} per brief; "
-            "set MERAKI_NETWORK_IDS or call the per-network tools)"
+            f"capped: {len(skipped)} more networks not checked (at most {MAX_BRIEF_NETWORKS} networks and "
+            f"{BRIEF_TIME_BUDGET:.0f} s per brief; set MERAKI_NETWORK_IDS or call the per-network tools)"
         )
     return "\n".join(lines).rstrip()
 

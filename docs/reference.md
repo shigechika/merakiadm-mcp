@@ -22,7 +22,7 @@ not healthy. Degraded means a device is offline or alerting.
 Per network: `[DEVICES]`, `[DEVICES-DOWN]`, `[AVAILABILITY]`, `[HEALTH]`,
 `[CONNECT]` / `[CONNECT-HIGH-FAILURE]` (with the previous window of the same
 length when `hours` is 84 or less) and `[CONNECT-TOP-AP]`, `[SECURITY]`,
-`[OPERATIONS]` / `[OPERATIONS-WARN]`, `[UPLINK]` / `[UPLINK-DOWN]`, or
+`[OPERATIONS]` / `[OPERATIONS-WARN]`, `[LOG-DROPPED]`, `[UPLINK]` / `[UPLINK-DOWN]`, or
 `[API-ERROR]`. Each network is CRITICAL (API error), WARNING (device down now
 or during the window, failures above the threshold, any security event, a
 warning-level operational event, an uplink down) or OK. Switch ports are only checked when the switch flags them
@@ -94,8 +94,9 @@ Default types: `multiple_dhcp_servers_detected`, `rogue_dhcp`,
 
 Default groups: reboot/firmware, RADIUS, DHCP, radio (DFS and automatic
 channel changes), wireless attack, switch hardware, switch config, switch
-port, roaming, event log (`events_dropped2`: the Dashboard dropped events,
-so counts are lower bounds). In `daily_brief`, reboots, RADIUS timeouts,
+port, roaming, event log (`events_dropped2`: an access point dropped `n`
+events of a high-volume type such as association; reported per type, and
+in `daily_brief` as `[LOG-DROPPED]`). In `daily_brief`, reboots, RADIUS timeouts,
 DHCP pool exhaustion, attacks and switch hardware/config/port faults raise a
 WARNING; radar, channel changes and dropped entries are informational.
 
@@ -106,7 +107,7 @@ WARNING; radar, channel changes and dropped entries are informational.
 | `product_type` | required | wireless, switch, appliance, camera, cellularGateway, sensor |
 | `network` | the only network in scope | name or ID |
 | `event_types` | all | event type names |
-| `per_page` | 50 | 1-100 |
+| `per_page` | 50 | 3-100 |
 | `cursor` | newest page | `older_cursor` from a previous answer |
 
 Ends with `older_cursor` and `complete`.

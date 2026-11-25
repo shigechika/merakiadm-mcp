@@ -12,6 +12,13 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from merakiadm_mcp import server
 
+
+def _recent(minutes_ago):
+    import datetime
+
+    moment = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=minutes_ago)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
 BASE = "https://api.meraki.com/api/v1"
 ORG = {"id": "100", "name": "Example Org"}
 NET = {
@@ -135,33 +142,38 @@ def test_air_marshal_reports_rogues_and_twins_not_the_raw_list():
 @respx.mock
 def test_security_events_counts_and_details():
     base_routes()
+    when = _recent(90)
     event = {
-        "occurredAt": "2026-11-13T14:49:22Z",
+        "occurredAt": when,
         "type": "multiple_dhcp_servers_detected",
         "deviceName": "ap-1",
+        "deviceSerial": "Q-AP1",
         "ssidNumber": 0,
         "eventData": {"server_ip": "192.0.2.1"},
     }
-    route = respx.get(f"{BASE}/networks/N_1/events").mock(return_value=httpx.Response(200, json={"events": [event]}))
+    old = {**event, "occurredAt": _recent(60 * 30)}
+    route = respx.get(f"{BASE}/networks/N_1/events").mock(return_value=httpx.Response(200, json={"events": [event, old]}))
     text = server.security_events(hours=24, top=5)
-    assert "- Total: 2" in text  # the mock answers once per product type queried
-    assert "multiple_dhcp_servers_detected 2" in text
-    assert "11-13 23:49 multiple_dhcp_servers_detected device=ap-1 ssid=CorpNet" in text
+    assert "- Total: 2" in text  # one per product type queried; the 30-hour-old one is outside the window
+    assert "multiple_dhcp_servers_detected 2 (1 devices)" in text
+    local = server._local(when, server._tz(NET))
+    assert f"{local} multiple_dhcp_servers_detected device=ap-1 ssid=CorpNet" in text
     assert "192.0.2.1" in text
     params = route.calls[0].request.url.params
     assert "ra_blocked" in params.get_list("includedEventTypes[]")
     assert {c.request.url.params["productType"] for c in route.calls} == {"switch", "wireless"}
+    assert "startingAfter" not in params  # newest page first
 
 
 @respx.mock
 def test_security_events_marks_capped_pages():
     base_routes()
-    events = [{"occurredAt": "2026-11-13T14:49:22Z", "type": "client_ip_conflict"}] * 1000
+    events = [{"occurredAt": _recent(5), "type": "client_ip_conflict"}] * 1000
     respx.get(f"{BASE}/networks/N_1/events").mock(
-        return_value=httpx.Response(200, json={"events": events}, headers={"Link": f"<{BASE}/networks/N_1/events?startingAfter=z>; rel=next"})
+        return_value=httpx.Response(200, json={"events": events}, headers={"Link": f"<{BASE}/networks/N_1/events?endingBefore=z>; rel=prev"})
     )
     text = server.security_events(hours=24, top=2)
-    assert "capped: more wireless, switch events not read" in text
+    assert "capped: older wireless, switch events in the window not read" in text
     assert "capped: 1998 more not shown" in text
 
 
@@ -325,12 +337,12 @@ def test_daily_brief_checks_at_most_the_network_budget(monkeypatch):
 @respx.mock
 def test_daily_brief_says_when_security_pages_were_left_unread():
     daily_routes({"success": 10})
-    clat = {"type": "client_ip_conflict", "eventData": {"ip": "192.0.0.2"}}
+    clat = {"occurredAt": _recent(5), "type": "client_ip_conflict", "eventData": {"ip": "192.0.0.2"}}
     respx.get(f"{BASE}/networks/N_1/events").mock(
-        side_effect=events_by_kind([clat] * 1000, headers={"Link": f"<{BASE}/networks/N_1/events?startingAfter=z>; rel=next"})
+        side_effect=events_by_kind([clat] * 1000, headers={"Link": f"<{BASE}/networks/N_1/events?endingBefore=z>; rel=prev"})
     )
     text = server.daily_brief(hours=24, failure_threshold=10.0, top=3)
-    assert "[SECURITY] none (capped: more wireless, switch events not read" in text
+    assert "[SECURITY] none (capped: older wireless, switch events in the window not read" in text
 
 
 def change(serial, name, ts, old, new):
@@ -340,12 +352,6 @@ def change(serial, name, ts, old, new):
         "details": {"old": [{"name": "status", "value": old}], "new": [{"name": "status", "value": new}]},
     }
 
-
-def _recent(minutes_ago):
-    import datetime
-
-    moment = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=minutes_ago)
-    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @respx.mock
@@ -374,16 +380,16 @@ def test_availability_history_pairs_outages():
 def test_operational_events_groups_and_flags_dropped_entries():
     base_routes()
     ops = [
-        {"occurredAt": "2026-11-25T08:00:00Z", "type": "boot", "deviceName": "ap-1"},
-        {"occurredAt": "2026-11-25T08:01:00Z", "type": "dfs_event", "deviceName": "ap-2"},
-        {"occurredAt": "2026-11-25T08:02:00Z", "type": "events_dropped2"},
+        {"occurredAt": _recent(30), "type": "boot", "deviceName": "ap-1"},
+        {"occurredAt": _recent(20), "type": "dfs_event", "deviceName": "ap-2"},
+        {"occurredAt": _recent(10), "type": "events_dropped2", "eventData": {"n": "34", "type": "association"}},
     ]
     route = respx.get(f"{BASE}/networks/N_1/events").mock(side_effect=events_by_kind(operational=ops))
     text = server.operational_events(hours=24, top=5)
     assert "- reboot/firmware: boot 2" in text  # one per product type queried
     assert "- radio: dfs_event 2" in text
     assert "- event log: events_dropped2 2" in text
-    assert "lower bound" in text
+    assert "Dropped by the access points (events_dropped2, events per type): association 68" in text
     assert "events_dropped2" not in text.split("## Newest", 1)[1]
     assert "8021x_radius_timeout" in route.calls[0].request.url.params.get_list("includedEventTypes[]")
 
@@ -394,14 +400,19 @@ def test_daily_brief_reports_outages_operations_and_trend():
         {"assoc": 0, "auth": 1, "dhcp": 9, "dns": 0, "success": 90},
         prev={"assoc": 0, "auth": 1, "dhcp": 2, "dns": 0, "success": 97},
         changes=[change("Q-AP1", "ap-1", _recent(30), "online", "offline"), change("Q-AP1", "ap-1", _recent(20), "offline", "online")],
-        ops=[{"type": "8021x_radius_timeout"}, {"type": "dfs_event"}, {"type": "events_dropped2"}],
+        ops=[
+            {"occurredAt": _recent(5), "type": "8021x_radius_timeout"},
+            {"occurredAt": _recent(5), "type": "dfs_event"},
+            {"occurredAt": _recent(5), "type": "events_dropped2", "eventData": {"n": "7", "type": "disassociation"}},
+        ],
     )
     text = server.daily_brief(hours=24, failure_threshold=50.0, top=3)
     assert "0 OK, 1 WARNING" in text
     assert "[AVAILABILITY] 1 device(s) not online at some point: ap-1 1x 10 min" in text
     assert "(previous 24h: 3.0% failed; biggest change: dhcp +7)" in text
     assert "[OPERATIONS-WARN] 8021x_radius_timeout 2" in text
-    assert "[OPERATIONS] dfs_event 2, events_dropped2 2 (events_dropped2:" in text
+    assert "[OPERATIONS] dfs_event 2" in text
+    assert "[LOG-DROPPED] access points dropped high-volume events: disassociation 14" in text
 
 
 @respx.mock
@@ -440,3 +451,14 @@ def test_brief_says_when_availability_history_was_cut():
     )
     text = server.daily_brief(hours=24, failure_threshold=10.0, top=3)
     assert "every device stayed online in the 0 status changes read (capped" in text
+
+
+@respx.mock
+def test_daily_brief_stops_starting_networks_after_the_time_budget(monkeypatch):
+    monkeypatch.setattr(server, "BRIEF_TIME_BUDGET", -1.0)
+    other = {**NET, "id": "N_2", "name": "Other Net"}
+    daily_routes({"success": 10})
+    respx.get(f"{BASE}/organizations/100/networks").mock(return_value=httpx.Response(200, json=[NET, other]))
+    text = server.daily_brief(hours=24, failure_threshold=10.0, top=3)
+    assert "1 networks: 1 OK" in text
+    assert "capped: 1 more networks not checked" in text
