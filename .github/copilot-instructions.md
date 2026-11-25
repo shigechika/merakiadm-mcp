@@ -15,7 +15,7 @@ python3 -m venv .venv
 ```
 
 This mirrors `.github/workflows/test.yml`: `pip install -e ".[test]"` and
-`pytest tests/ -v` on Python 3.10-3.14 plus one Windows job, and a `lint` job
+`pytest tests/ -v` on Python 3.11-3.15 plus one Windows job, and a `lint` job
 running `ruff check .` at a pinned version. Lint findings are already
 enforced; `ruff format` is not gated, so formatting nits are noise.
 

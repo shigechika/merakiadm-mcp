@@ -50,7 +50,7 @@ uvx merakiadm-mcp --check        # verify the API key
 pip install merakiadm-mcp
 ```
 
-Python 3.10 or later.
+Python 3.11 or later.
 
 ## Configuration
 

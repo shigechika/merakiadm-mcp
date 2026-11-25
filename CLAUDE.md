@@ -62,7 +62,7 @@ MERAKI_DASHBOARD_API_KEY=... .venv/bin/python scripts/smoke_test.py   # live smo
   `.ja.md` translations). No deployment-specific values (network, device,
   SSID names, IDs, addresses) anywhere — `tests/test_smoke_probes.py`
   enforces it for the probe specs.
-- Python 3.10+ (`from __future__ import annotations`); `zoneinfo` needs the
+- Python 3.11+ (`from __future__ import annotations`); `zoneinfo` needs the
   `tzdata` dependency on Windows.
 - stdout is the JSON-RPC channel while serving: no `print()` in `server.py` /
   `client.py`.
