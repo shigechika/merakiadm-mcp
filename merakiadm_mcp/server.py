@@ -400,10 +400,14 @@ def _split_clat(events: list[dict]) -> tuple[list[dict], int]:
 
 
 def _parse_ts(value: Any) -> Optional[datetime.datetime]:
+    """An ISO 8601 time, or the co-term license form "Feb 8, 2020 UTC"; None otherwise."""
     try:
         moment = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
-        return None
+        try:
+            moment = datetime.datetime.strptime(str(value).strip().removesuffix(" UTC"), "%b %d, %Y")
+        except ValueError:
+            return None
     return moment if moment.tzinfo else moment.replace(tzinfo=datetime.timezone.utc)
 
 
@@ -2366,13 +2370,15 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
 
             step()
             body.append(_changes_line(net, hours, top))
+            step()
             body.append(_firmware_line(net, _tz(net)))
+            step()
             if org_id not in licensed:
                 licensed.add(org_id)
                 org = next((o for o in _organizations() if str(o.get("id")) == str(org_id)), {"id": org_id})
                 line, warn = _license_line(org)
                 body.append(line)
-                if warn:
+                if warn and tier == "OK":
                     tier = "WARNING"
         except _BriefTimeUp:
             body.append(f"- capped: the brief reached {BRIEF_STEP_LIMIT:.0f} s; the rest of this network was not checked")

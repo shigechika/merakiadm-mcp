@@ -266,7 +266,7 @@ def daily_routes(stats, events=(), ports=None, avail=None, changes=(), ops=(), p
         "wireless": {"currentVersion": {"shortName": "MR 31.1"}, "nextUpgrade": {"time": "2026-12-01T18:00:00Z", "toVersion": {"shortName": "MR 31.2"}}},
         "switch": {"currentVersion": {"shortName": "MS 18.1"}, "nextUpgrade": {"time": "", "toVersion": {}}},
     }}))
-    respx.get(f"{BASE}/organizations/100/licenses/overview").mock(return_value=httpx.Response(200, json={"status": "OK", "expirationDate": "2099-01-01T00:00:00Z"}))
+    respx.get(f"{BASE}/organizations/100/licenses/overview").mock(return_value=httpx.Response(200, json={"status": "OK", "expirationDate": "Jan 1, 2099 UTC"}))
 
 
 CHANGES = [
@@ -1004,3 +1004,8 @@ def test_change_log_paging_stops_when_a_page_only_repeats():
         if r.url.params.get("startingAfter") else httpx.Response(200, json=CHANGES, headers=link))
     rows, capped = server._org_changes("100", 24)
     assert len(rows) == 3 and capped is False
+
+
+def test_co_term_expiration_dates_are_read():
+    assert server._parse_ts("Feb 8, 2020 UTC") == server.datetime.datetime(2020, 2, 8, tzinfo=server.datetime.timezone.utc)
+    assert server._parse_ts("nonsense") is None
