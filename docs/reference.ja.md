@@ -23,7 +23,8 @@ error）、`service`、`version`、`base_url`、`auth`（ok / error / missing-en
 `[UPLINK-DOWN]`、または `[API-ERROR]` を出し、CRITICAL（API のエラー）、
 WARNING（機器の停止、しきい値を超える失敗、セキュリティのイベント、
 アップリンクの断）、OK に分けます。スイッチのポートは、アップリンクの印が
-付いたものだけを見ます。
+付いたものだけを見ます。1 回に点検するのは 25 ネットワークまでで、残りは
+`capped` として数だけ示します。
 
 ## connection_failures
 

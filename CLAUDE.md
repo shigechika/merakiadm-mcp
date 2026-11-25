@@ -18,10 +18,11 @@ MERAKI_DASHBOARD_API_KEY=... .venv/bin/python scripts/smoke_test.py   # live smo
 ## Architecture
 
 - `merakiadm_mcp/client.py` — `MerakiClient`: httpx, GET only, Bearer auth.
-  Returns one page per call (`Page`) with the `Link` header parsed into
+  `page()` returns one page (`Page`) with the `Link` header parsed into
   `links` (only `startingAfter` / `endingBefore` / `t0` / `t1` survive, see
-  `CURSOR_PARAMS`); it never follows pagination by itself. Redirects are
-  followed by hand and only to `meraki.com` hosts (httpx drops the
+  `CURSOR_PARAMS`); `get_all()` follows `rel=next` for at most `max_pages`
+  and reports `capped`. Redirects are followed by hand and only to `https`
+  `meraki.com` hosts (httpx drops the
   Authorization header on cross-host redirects). 429 and 5xx are retried with
   `Retry-After` within a retry budget. httpx/httpcore logging is held at WARNING.
 - `merakiadm_mcp/server.py` — `MCPServer` with 6 tools: `health_check`,

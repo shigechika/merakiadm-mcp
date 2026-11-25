@@ -91,3 +91,26 @@ def test_error_body_is_reported_without_the_key():
         make().get("/organizations")
     assert "Invalid API key" in str(exc.value)
     assert "test-key" not in str(exc.value)
+
+
+@respx.mock
+def test_plain_http_redirect_is_refused_even_to_meraki():
+    respx.get(f"{BASE}/organizations").mock(
+        return_value=httpx.Response(302, headers={"Location": "http://n1.meraki.com/api/v1/organizations"})
+    )
+    with pytest.raises(MerakiAPIError, match="refused redirect to http://"):
+        make().get("/organizations")
+
+
+@respx.mock
+def test_get_all_follows_next_within_budget():
+    nxt = f'<{BASE}/organizations/1/devices?startingAfter=b>; rel=next'
+    respx.get(f"{BASE}/organizations/1/devices").mock(
+        side_effect=[
+            httpx.Response(200, json=[{"serial": "a"}], headers={"Link": nxt}),
+            httpx.Response(200, json=[{"serial": "b"}], headers={"Link": nxt}),
+        ]
+    )
+    items, capped = make().get_all("/organizations/1/devices", {"perPage": 1}, max_pages=2)
+    assert [i["serial"] for i in items] == ["a", "b"]
+    assert capped is True

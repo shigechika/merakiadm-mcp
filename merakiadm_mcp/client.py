@@ -135,10 +135,12 @@ class MerakiClient:
         while True:
             response = self._http.get(url, params=params)
             if response.status_code in (301, 302, 303, 307, 308):
-                location = response.headers.get("Location", "")
-                host = urllib.parse.urlsplit(location).hostname or ""
-                if redirects >= 3 or not (host == "meraki.com" or host.endswith(".meraki.com")):
-                    raise MerakiAPIError(response.status_code, f"refused redirect to {host or '?'}", path)
+                location = urllib.parse.urljoin(url, response.headers.get("Location", ""))
+                target = urllib.parse.urlsplit(location)
+                host = target.hostname or ""
+                trusted = target.scheme == "https" and (host == "meraki.com" or host.endswith(".meraki.com"))
+                if redirects >= 3 or not trusted:
+                    raise MerakiAPIError(response.status_code, f"refused redirect to {target.scheme}://{host or '?'}", path)
                 url, params, redirects = location, None, redirects + 1
                 continue
             if response.status_code == 429 or response.status_code >= 500:
@@ -157,6 +159,23 @@ class MerakiClient:
     def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         """GET one page of ``path`` and return only its body."""
         return self.page(path, params).data
+
+    def get_all(self, path: str, params: dict[str, Any] | None = None, max_pages: int = 10) -> tuple[list, bool]:
+        """Follow ``rel=next`` for at most ``max_pages`` pages of a list endpoint.
+
+        Returns (items, capped); capped is True when a next page was left unread.
+        """
+        items: list = []
+        query = dict(params or {})
+        for _ in range(max_pages):
+            page = self.page(path, query)
+            data = page.data
+            items.extend((data.get("items") or []) if isinstance(data, dict) else (data or []))
+            nxt = page.links.get("next")
+            if not nxt:
+                return items, False
+            query = {**(params or {}), **nxt}
+        return items, True
 
 
 def _retry_after(response: httpx.Response, attempt: int) -> float:

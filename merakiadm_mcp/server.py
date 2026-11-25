@@ -60,6 +60,7 @@ EVENT_PRODUCT_TYPES = ("wireless", "switch", "appliance", "camera", "cellularGat
 FAILURE_STEPS = ("assoc", "auth", "dhcp", "dns")
 MAX_HOURS = 168  # the failed-connection and connection-stats endpoints look back at most 7 days
 CACHE_SECONDS = 300
+MAX_BRIEF_NETWORKS = 25  # each network costs about six requests and a section of output
 _EVENT_TYPE_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 #: RFC 7335 IPv4 Service Continuity Prefix: 464XLAT (CLAT) clients all use
 #: 192.0.0.2 on purpose, so a "conflict" on it is not a real duplicate.
@@ -206,7 +207,7 @@ def _device_names(org_id: str) -> dict[str, str]:
     """serial -> device name (the serial itself when a device has no name)."""
 
     def load():
-        devices = _get_client().get(f"/organizations/{org_id}/devices", {"perPage": 1000}) or []
+        devices, _ = _get_client().get_all(f"/organizations/{org_id}/devices", {"perPage": 1000})
         return {d["serial"]: d.get("name") or d["serial"] for d in devices if d.get("serial")}
 
     return _cached(f"devices:{org_id}", load)
@@ -256,7 +257,10 @@ def _bound(value: int, low: int, high: int) -> int:
 
 
 def _top(counter: collections.Counter, n: int) -> str:
-    return ", ".join(f"{k} {v:,}" for k, v in counter.most_common(n)) or "none"
+    text = ", ".join(f"{k} {v:,}" for k, v in counter.most_common(n)) or "none"
+    if len(counter) > n:
+        text += f", +{len(counter) - n} more"
+    return text
 
 
 def _iso_ago(hours: int) -> str:
@@ -334,8 +338,8 @@ def health_check() -> dict:
     Always returns the same keys: ``status`` (healthy / degraded / error),
     ``service``, ``version``, ``base_url``, ``auth`` (ok / error /
     missing-env), ``organizations`` and ``networks`` (counts) and ``devices``
-    (counts by status: online / alerting / offline / dormant). A degraded or
-    error result adds ``detail``.
+    (counts by status: online / alerting / offline / dormant, limited to
+    MERAKI_NETWORK_IDS when set). A degraded or error result adds ``detail``.
     """
     result: dict = {
         "status": "healthy",
@@ -353,8 +357,15 @@ def health_check() -> dict:
         result["organizations"] = len(orgs)
         result["networks"] = len(_networks())
         totals: collections.Counter = collections.Counter()
+        scoped = bool(_env_list("MERAKI_NETWORK_IDS"))
         for org in orgs:
-            overview = _get_client().get(f"/organizations/{org['id']}/devices/statuses/overview") or {}
+            params = {}
+            if scoped:
+                ids = [n["id"] for n in _networks() if n.get("organizationId") == org["id"]]
+                if not ids:
+                    continue
+                params = {"networkIds[]": ids}
+            overview = _get_client().get(f"/organizations/{org['id']}/devices/statuses/overview", params) or {}
             totals.update((overview.get("counts") or {}).get("byStatus") or {})
         result["devices"] = dict(totals)
         if totals.get("offline") or totals.get("alerting"):
@@ -628,18 +639,9 @@ def list_events(
 
 def _switch_ports(org_id: str, net_ids: list[str], max_pages: int = 10):
     """Port statuses per switch for the networks. Returns (switches, capped)."""
-    switches: list[dict] = []
-    params: dict[str, Any] = {"networkIds[]": net_ids, "perPage": 20}
-    for _ in range(max_pages):
-        page = _get_client().page(f"/organizations/{org_id}/switch/ports/statuses/bySwitch", params)
-        data = page.data
-        items = (data.get("items") or []) if isinstance(data, dict) else (data or [])
-        switches.extend(items)
-        nxt = page.links.get("next")
-        if not nxt:
-            return switches, False
-        params = {"networkIds[]": net_ids, "perPage": 20, **nxt}
-    return switches, True
+    return _get_client().get_all(
+        f"/organizations/{org_id}/switch/ports/statuses/bySwitch", {"networkIds[]": net_ids, "perPage": 20}, max_pages
+    )
 
 
 def _uplink_problems(switches: list[dict]) -> tuple[int, list[str]]:
@@ -670,6 +672,8 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
     security-relevant events (see security_events), and switch uplink ports
     that are not connected.
 
+    At most 25 networks are checked per call; the rest are counted as capped.
+
     Output tiers:
     - CRITICAL — the API could not be read for that network
     - WARNING  — a device offline or alerting, connection failures above
@@ -689,6 +693,8 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
         nets = _pick_networks(None)
     except Exception as exc:  # noqa: BLE001 - the brief reports, it does not raise
         return f"{header}\n## CRITICAL — API error: {exc}"
+    skipped = nets[MAX_BRIEF_NETWORKS:]
+    nets = nets[:MAX_BRIEF_NETWORKS]
 
     sections: list[tuple[str, list[str]]] = []
     for net in nets:
@@ -697,11 +703,15 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
         products = net.get("productTypes") or []
         try:
             names = _device_names(org_id)
-            avail = _get_client().get(
+            avail, avail_capped = _get_client().get_all(
                 f"/organizations/{org_id}/devices/availabilities", {"networkIds[]": [net["id"]], "perPage": 1000}
-            ) or []
+            )
             status = collections.Counter(d.get("status") for d in avail)
-            body.append("- [DEVICES] " + ", ".join(f"{s} {status.get(s, 0)}" for s in ("online", "alerting", "offline", "dormant")))
+            body.append(
+                "- [DEVICES] "
+                + ", ".join(f"{s} {status.get(s, 0)}" for s in ("online", "alerting", "offline", "dormant"))
+                + (" (capped: more devices not read)" if avail_capped else "")
+            )
             down = [d for d in avail if d.get("status") in ("offline", "alerting")]
             if down:
                 tier = "WARNING"
@@ -734,11 +744,12 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
                 counts.update(e.get("type") for e in _split_clat(events)[0])
                 if more:
                     capped.append(product)
+            more_note = f" (capped: more {', '.join(capped)} events not read)" if capped else ""
             if counts:
                 tier = "WARNING"
-                body.append(f"- [SECURITY] {_top(counts, 20)}{' (capped)' if capped else ''} — see security_events")
+                body.append(f"- [SECURITY] {_top(counts, 20)}{more_note} — see security_events")
             else:
-                body.append("- [SECURITY] none")
+                body.append(f"- [SECURITY] none{more_note}")
 
             if "switch" in products:
                 switches, more = _switch_ports(org_id, [net["id"]])
@@ -748,6 +759,7 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
                     body.append(
                         f"- [UPLINK-DOWN] {'; '.join(problems[:top])}"
                         + (f" … capped: {len(problems) - top} more" if len(problems) > top else "")
+                        + (" (capped: more switches not read)" if more else "")
                     )
                 elif uplinks:
                     body.append(f"- [UPLINK] {len(switches)} switches, {uplinks} uplink ports, none down{' (capped)' if more else ''}")
@@ -768,6 +780,11 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
     for _, body in sorted(sections, key=lambda s: order[s[0]]):
         lines.extend(body)
         lines.append("")
+    if skipped:
+        lines.append(
+            f"capped: {len(skipped)} more networks not checked (at most {MAX_BRIEF_NETWORKS} per brief; "
+            "set MERAKI_NETWORK_IDS or call the per-network tools)"
+        )
     return "\n".join(lines).rstrip()
 
 

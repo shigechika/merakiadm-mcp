@@ -24,7 +24,8 @@ Per network: `[DEVICES]`, `[DEVICES-DOWN]`, `[HEALTH]`, `[CONNECT]` /
 `[UPLINK-DOWN]`, or `[API-ERROR]`. Each network is CRITICAL (API error),
 WARNING (device down, failures above the threshold, any security event, an
 uplink down) or OK. Switch ports are only checked when the switch flags them
-as uplinks.
+as uplinks. At most 25 networks are checked per call; the rest are reported
+as `capped`.
 
 ## connection_failures
 

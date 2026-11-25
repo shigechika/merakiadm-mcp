@@ -273,3 +273,43 @@ def test_every_tool_is_read_only():
     assert tools
     for tool in tools:
         assert tool.annotations and tool.annotations.read_only_hint, tool.name
+
+
+def test_top_says_how_many_were_left_out():
+    import collections
+
+    assert server._top(collections.Counter({"a": 3, "b": 2, "c": 1}), 2) == "a 3, b 2, +1 more"
+
+
+@respx.mock
+def test_health_check_counts_only_the_configured_networks(monkeypatch):
+    monkeypatch.setenv("MERAKI_NETWORK_IDS", "N_1")
+    base_routes(nets=(NET, {**NET, "id": "N_2", "name": "Other"}))
+    route = respx.get(f"{BASE}/organizations/100/devices/statuses/overview").mock(
+        return_value=httpx.Response(200, json={"counts": {"byStatus": {"online": 3}}})
+    )
+    result = server.health_check()
+    assert result["networks"] == 1
+    assert route.calls[0].request.url.params.get_list("networkIds[]") == ["N_1"]
+
+
+@respx.mock
+def test_daily_brief_checks_at_most_the_network_budget(monkeypatch):
+    monkeypatch.setattr(server, "MAX_BRIEF_NETWORKS", 1)
+    other = {**NET, "id": "N_2", "name": "Other Net"}
+    daily_routes({"success": 10})
+    respx.get(f"{BASE}/organizations/100/networks").mock(return_value=httpx.Response(200, json=[NET, other]))
+    text = server.daily_brief(hours=24, failure_threshold=10.0, top=3)
+    assert "1 networks: 1 OK" in text
+    assert "capped: 1 more networks not checked" in text
+
+
+@respx.mock
+def test_daily_brief_says_when_security_pages_were_left_unread():
+    daily_routes({"success": 10})
+    clat = {"type": "client_ip_conflict", "eventData": {"ip": "192.0.0.2"}}
+    respx.get(f"{BASE}/networks/N_1/events").mock(
+        return_value=httpx.Response(200, json={"events": [clat] * 1000}, headers={"Link": f"<{BASE}/networks/N_1/events?startingAfter=z>; rel=next"})
+    )
+    text = server.daily_brief(hours=24, failure_threshold=10.0, top=3)
+    assert "[SECURITY] none (capped: more wireless, switch events not read)" in text

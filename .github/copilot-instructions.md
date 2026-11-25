@@ -41,7 +41,8 @@ raw API list, removes a clamp, or drops data without saying so.
 `MERAKI_DASHBOARD_API_KEY` is sent only as the `Authorization: Bearer`
 header. Flag anything that can put it in a log line, an exception message
 or a tool response. httpx/httpcore loggers are held at WARNING in
-`client.py`. Redirects are followed by hand and only to `meraki.com` hosts,
+`client.py`. Redirects are followed by hand and only to `https` URLs on
+`meraki.com` hosts,
 because httpx strips the header on cross-host redirects and following an
 arbitrary `Location` with the header would leak it.
 
