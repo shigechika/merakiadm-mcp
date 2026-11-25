@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "merakiadm-mcp"
+dynamic = ["version"]
+description = "Read-only MCP server for Cisco Meraki Dashboard administrators: bounded health, connection, Air Marshal and event summaries"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    {name = "AIKAWA Shigechika"},
+]
+keywords = ["meraki", "cisco", "mcp", "model-context-protocol", "network", "wireless"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    "mcp>=2,<3",
+    "httpx>=0.27",
+    "tzdata; sys_platform == 'win32'",
+]
+
+[project.scripts]
+merakiadm-mcp = "merakiadm_mcp.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/shigechika/merakiadm-mcp"
+Repository = "https://github.com/shigechika/merakiadm-mcp"
+Issues = "https://github.com/shigechika/merakiadm-mcp/issues"
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-cov", "respx"]
+
+[tool.setuptools]
+packages = ["merakiadm_mcp"]
+
+[tool.setuptools.dynamic]
+version = {attr = "merakiadm_mcp.__version__"}

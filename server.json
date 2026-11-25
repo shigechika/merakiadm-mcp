@@ -1,0 +1,23 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.shigechika/merakiadm-mcp",
+  "title": "Meraki Admin MCP",
+  "description": "Read-only MCP server for Cisco Meraki Dashboard administrators: bounded health, connection, Air Marshal and event summaries",
+  "repository": {
+    "url": "https://github.com/shigechika/merakiadm-mcp",
+    "source": "github"
+  },
+  "version": "0.0.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "merakiadm-mcp",
+      "version": "0.0.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

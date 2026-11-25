@@ -1,0 +1,59 @@
+site_name: merakiadm-mcp
+site_description: >-
+  Read-only MCP server for Cisco Meraki Dashboard administrators - bounded
+  health, connection, Air Marshal and event summaries.
+site_url: https://shigechika.github.io/merakiadm-mcp/
+repo_url: https://github.com/shigechika/merakiadm-mcp
+repo_name: shigechika/merakiadm-mcp
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.footer
+    - content.code.copy
+    - content.action.edit
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.superfences
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search
+  - i18n:
+      docs_structure: suffix
+      languages:
+        - locale: en
+          name: English
+          default: true
+          build: true
+        - locale: ja
+          name: 日本語
+          build: true
+
+nav:
+  - Home: index.md
+  - Setup: setup.md
+  - Reference: reference.md

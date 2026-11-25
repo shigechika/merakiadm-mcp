@@ -1,0 +1,58 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # Pinned, not floating: a ruff release that adds a rule to its default
+      # set would otherwise turn this gate red on a commit that changed
+      # nothing. Bumping it is then a deliberate PR with the new findings
+      # visible in the diff.
+      - name: Install ruff
+        run: pip install ruff==0.16.0
+
+      # check only — see ruff.toml for why `ruff format` is not gated here.
+      - name: Lint
+        run: ruff check .
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          # Smoke-test on Windows to guard against stdio newline regressions
+          # (cf. modelcontextprotocol/python-sdk#2433). One Python version is
+          # sufficient since the bug is platform-level, not version-specific.
+          - os: windows-latest
+            python-version: "3.x"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install -e ".[test]"
+
+      - name: Run tests
+        run: pytest tests/ -v
