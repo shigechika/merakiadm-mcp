@@ -707,7 +707,6 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
         org_id = net["organizationId"]
         products = net.get("productTypes") or []
         try:
-            names, names_capped = _device_names(org_id)
             avail, avail_capped = _get_client().get_all(
                 f"/organizations/{org_id}/devices/availabilities", {"networkIds[]": [net["id"]], "perPage": 1000}
             )
@@ -738,6 +737,7 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
                 tier = "WARNING" if flag else tier
                 body.append(f"- [CONNECT{'-HIGH-FAILURE' if flag else ''}] {summary}")
                 if flag:
+                    names, names_capped = _device_names(org_id)
                     per_ap = collections.Counter(names.get(r.get("serial"), r.get("serial")) for r in _failed_connections(net, hours))
                     body.append(f"- [CONNECT-TOP-AP] {_top(per_ap, top)}{' (' + NAMES_CAPPED + ')' if names_capped else ''}")
 
