@@ -708,9 +708,13 @@ def test_api_get_stays_in_scope(monkeypatch):
         server.api_get("/organizations/100/admins")
     with pytest.raises(ToolError, match="network N_2 is not in scope"):
         server.api_get("/organizations/100/devices/statuses", params={"networkIds": ["N_2"]})
+    with pytest.raises(ToolError, match="network N_2 is not in scope"):
+        server.api_get("/organizations/100/devices/statuses", params={"networkIds": "N_2"})
     statuses = respx.get(f"{BASE}/organizations/100/devices/statuses").mock(return_value=httpx.Response(200, json=[]))
     server.api_get("/organizations/100/devices/statuses")
     assert statuses.calls[0].request.url.params.get_list("networkIds[]") == ["N_1"]
+    server.api_get("/organizations/100/devices/statuses", params={"networkIds": "N_1"})
+    assert "networkIds" not in statuses.calls[1].request.url.params
     device = respx.get(f"{BASE}/devices/Q-AP1").mock(return_value=httpx.Response(200, json={"serial": "Q-AP1"}))
     assert server.api_get("/devices/Q-AP1")["data"] == {"serial": "Q-AP1"} and device.called
 
@@ -741,6 +745,35 @@ def test_api_get_bounds_a_huge_list_and_returns_paging_params():
     assert len(json.dumps(result)) <= 8000
     assert result["next_params"] == {"startingAfter": "abc"}
     assert result["data"][0]["bssids"][-1].endswith("more items")
+    assert result["returned"] == len(result["data"]) < 200
+
+
+@respx.mock
+def test_api_get_keeps_the_whole_answer_within_max_chars():
+    base_routes()
+    respx.get(f"{BASE}/networks/N_1/clients").mock(return_value=httpx.Response(200, json=[{"k" + str(i): "v" * 50 for i in range(400)}] * 3))
+    result = server.api_get("/networks/N_1/clients", params={"description": "x" * 5000, "mac": ["y" * 300] * 50}, max_chars=2000)
+    assert len(json.dumps(result, ensure_ascii=False)) <= 2000 and result["capped"] is True
+
+
+@respx.mock
+def test_api_get_refuses_administered_reads_under_a_scope(monkeypatch):
+    base_routes()
+    monkeypatch.setenv("MERAKI_ORG_ID", "100")
+    with pytest.raises(ToolError, match="/administered reads cannot be narrowed"):
+        server.api_get("/administered/licensing/subscription/subscriptions")
+    me = respx.get(f"{BASE}/administered/identities/me").mock(return_value=httpx.Response(200, json={"name": "x"}))
+    server.api_get("/administered/identities/me")
+    assert me.called
+
+
+@respx.mock
+def test_api_get_wants_network_id_strings(monkeypatch):
+    base_routes()
+    spec_route()
+    monkeypatch.setenv("MERAKI_NETWORK_IDS", "N_1")
+    with pytest.raises(ToolError, match="network ID strings"):
+        server.api_get("/organizations/100/devices/statuses", params={"networkIds": 5})
 
 
 @respx.mock

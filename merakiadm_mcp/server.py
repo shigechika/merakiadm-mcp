@@ -1215,6 +1215,7 @@ _SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.:~-]{1,128}$")
 _PARAM_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}(\[\])?$")
 API_INDEX_SECONDS = 6 * 3600
 API_MAX_CHARS = 20_000
+NOTE_CAPPED = "part of the answer was left out: use fields=, offset=/limit= or narrower params"
 REDACTED = "[redacted]"
 #: A key is secret when its lower-cased name contains one of these. Booleans stay.
 _SECRET_KEY = re.compile(
@@ -1405,8 +1406,12 @@ def _api_scope(segments: list[str], path: str, params: dict[str, Any]) -> None:
             op = _match_operation(path)
             if op is None or not any(p["name"] == "networkIds" and p["in"] == "query" for p in op["params"]):
                 raise ToolError("MERAKI_NETWORK_IDS limits the scope, and this organization-wide read cannot be narrowed to those networks")
-            asked = params.get("networkIds[]")
-            asked = [asked] if isinstance(asked, str) else list(asked or [])
+            asked: Any = []
+            for key in ("networkIds", "networkIds[]"):
+                value = params.pop(key, None)
+                asked += value if isinstance(value, list) else [] if value is None else [value]
+            if not all(isinstance(n, str) for n in asked):
+                raise ToolError("networkIds must be network ID strings")
             outside = [n for n in asked if n not in scope]
             if outside:
                 raise ToolError(f"network {outside[0]} is not in scope (MERAKI_NETWORK_IDS)")
@@ -1417,6 +1422,9 @@ def _api_scope(segments: list[str], path: str, params: dict[str, Any]) -> None:
     elif root == "devices" and len(segments) > 1:
         if segments[1] not in _scoped_serials():
             raise ToolError(f"device {segments[1]} is not in a network in scope")
+    elif root == "administered" and segments != ["administered", "identities", "me"]:
+        if _env_list("MERAKI_ORG_ID") or _env_list("MERAKI_NETWORK_IDS"):
+            raise ToolError("MERAKI_ORG_ID / MERAKI_NETWORK_IDS limit the scope, and /administered reads cannot be narrowed to it")
 
 
 def _api_params(params: Optional[dict]) -> dict[str, Any]:
@@ -1525,55 +1533,75 @@ def api_get(
 
     result: dict[str, Any] = {"path": path}
     if query:
-        result["params"] = query
-    container, list_key, items = None, None, data
-    if isinstance(data, dict):
-        lists = [k for k, v in data.items() if isinstance(v, list)]
-        list_key = "items" if "items" in lists else (lists[0] if len(lists) == 1 else None)
-        if list_key:
-            container, items = data, data[list_key]
-    if isinstance(items, list):
-        result["total_items"] = len(items)
-        if list_key:
-            result["list_key"] = list_key
-        window = items[offset : offset + limit]
-        if fields:
-            window = _project(window, fields)
-        result["offset"] = offset
-        result["returned"] = len(window)
-        capped = offset + len(window) < len(items)
-        shaped: Any = {**{k: v for k, v in container.items() if k != list_key}, list_key: window} if container else window
-    else:
-        capped = False
-        shaped = _project(data, fields) if fields else data
+        result["params"] = _shrink(query, 20, 200, {})
     if redacted[0]:
         result["redacted"] = redacted[0]
     for rel in ("next", "prev"):
         if page_links.get(rel):
-            result[f"{rel}_params"] = page_links[rel]
+            result[f"{rel}_params"] = _shrink(page_links[rel], 5, 300, {})
 
-    budget = max_chars - _size(result) - 200
+    list_key, rest, items = None, None, data
+    if isinstance(data, dict):
+        lists = [k for k, v in data.items() if isinstance(v, list)]
+        list_key = "items" if "items" in lists else (lists[0] if len(lists) == 1 else None)
+        if list_key:
+            rest, items = {k: v for k, v in data.items() if k != list_key}, data[list_key]
+    window = None
+    if isinstance(items, list):
+        result["total_items"] = len(items)
+        if list_key:
+            result["list_key"] = list_key
+        result["offset"] = offset
+        window = items[offset : offset + limit]
+        if fields:
+            window = _project(window, fields)
+    elif fields:
+        data = _project(data, fields)
+
+    def build(rows: Any, extra: Any, list_max: int, str_max: int, state: dict) -> Any:
+        if rows is None:
+            return _shrink(data, list_max, str_max, state)
+        shrunk = [_shrink(r, list_max, str_max, state) for r in rows]
+        if extra is None:
+            return shrunk
+        return {**_shrink(extra, list_max, str_max, state), list_key: shrunk}
+
+    def fits(shaped: Any) -> bool:
+        return _size({**result, "capped": True, "note": NOTE_CAPPED, "data": shaped}) <= max_chars
+
     state: dict[str, Any] = {}
+    shaped = build(window, rest, 10**9, 10**9, state)
     for list_max, str_max in ((50, 2000), (20, 500), (10, 200), (5, 100), (2, 60), (1, 40)):
-        if _size(shaped) <= budget:
+        if fits(shaped):
             break
-        state = {}
-        shaped = _shrink(shaped, list_max, str_max, state)
-    if state.get("cut"):
-        capped = True
-    if _size(shaped) > budget and isinstance(shaped, list):
-        while len(shaped) > 1 and _size(shaped) > budget:
-            shaped = shaped[: max(1, len(shaped) // 2)]
-        result["returned"] = len(shaped)
-        capped = True
-    if _size(shaped) > budget:
-        keys = sorted({k for v in (shaped if isinstance(shaped, list) else [shaped]) if isinstance(v, dict) for k in v})
-        shaped = {"keys": keys}
+        state = {}  # each pass starts from the unshrunk answer, so its state is the whole story
+        shaped = build(window, rest, list_max, str_max, state)
+    capped = bool(state.get("cut"))
+    if window is not None:
+        rows = list(window)
+        while rows and not fits(shaped):
+            rows = rows[: len(rows) // 2] if len(rows) > 1 else []
+            shaped = build(rows, rest, list_max, str_max, state)
+        result["returned"] = len(rows)
+        capped = capped or offset + len(rows) < len(items) or len(rows) < len(window)
+    if not fits(shaped):
+        source = window if window is not None else data
+        keys = sorted({k for v in (source if isinstance(source, list) else [source]) if isinstance(v, dict) for k in v})
+        shaped = {"keys": keys[:100]}
+        while keys and not fits(shaped):
+            keys = keys[: len(keys) // 2]
+            shaped = {"keys": keys}
+        if window is not None:
+            result["returned"] = 0
         capped = True
         result["note"] = "the answer is too large even when shrunk; only its keys are shown: pass fields= to pick some"
     result["capped"] = capped
     if capped and "note" not in result:
-        result["note"] = "part of the answer was left out: use fields=, offset=/limit= or narrower params"
+        result["note"] = NOTE_CAPPED
+    if _size({**result, "data": shaped}) > max_chars:
+        result.pop("params", None)
+        shaped = None
+        result["note"] = "the answer cannot fit max_chars; raise max_chars or narrow the request"
     result["data"] = shaped
     return result
 
