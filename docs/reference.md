@@ -191,7 +191,7 @@ clients send them that way); `fields` also as a comma-separated string.
 
 Returns a dict: `path`, `observed_at` (UTC), `operation` (the operation ID,
 when the index is already cached), `params`, `pages_read`, `has_next_page`, `total_items` / `offset` / `returned` (and
-`list_key` when the list sits inside an object, such as `events`),
+`list_name` when the list sits inside an object, such as `events`),
 `redacted` (how many values were masked), `next_params` / `prev_params`,
 `capped`, `note` and `data`.
 

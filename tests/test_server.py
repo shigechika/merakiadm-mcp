@@ -807,7 +807,7 @@ def test_api_get_windows_the_list_inside_an_object():
     body = {"message": None, "pageStartAt": "x", "events": [{"type": "boot", "n": i} for i in range(30)]}
     respx.get(f"{BASE}/networks/N_1/events").mock(return_value=httpx.Response(200, json=body))
     result = server.api_get("/networks/N_1/events", fields=["n"], offset=5, limit=3)
-    assert result["list_key"] == "events" and result["total_items"] == 30 and result["capped"] is True
+    assert result["list_name"] == "events" and result["total_items"] == 30 and result["capped"] is True
     assert result["data"] == {"message": None, "pageStartAt": "x", "events": [{"n": 5}, {"n": 6}, {"n": 7}]}
 
 

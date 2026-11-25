@@ -2044,7 +2044,7 @@ def api_get(
 
     For what the other tools do not cover; find the operation with find_api
     first. Reads one page, or up to ``max_pages``. A list answer (or the one list inside an
-    object, named by ``list_key``, e.g. "events") is cut to ``limit`` items from
+    object, named by ``list_name``, e.g. "events") is cut to ``limit`` items from
     ``offset`` (``total_items`` says how many came back), ``fields`` keeps only
     the named keys of each item (dotted paths reach inside, e.g.
     "device.name"), and the whole answer is shrunk to ``max_chars``: long
@@ -2140,7 +2140,7 @@ def api_get(
     if isinstance(items, list):
         result["total_items"] = len(items)
         if list_key:
-            result["list_key"] = list_key
+            result["list_name"] = list_key
         result["offset"] = offset
         window = items[offset : offset + limit]
         if fields:

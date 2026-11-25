@@ -183,7 +183,7 @@ WARNING にし、レーダー、チャネル変更、取りこぼしは参考と
 
 dict を返します：`path`、`observed_at`（UTC）、`operation`（API の一覧を覚えて
 いるときの operation ID）、`params`、`pages_read`、`has_next_page`、`total_items` / `offset` / `returned`（一覧が
-オブジェクトの中にあるとき、たとえば `events` は `list_key` も）、`redacted`
+オブジェクトの中にあるとき、たとえば `events` は `list_name` も）、`redacted`
 （伏せた値の数）、`next_params` / `prev_params`、`capped`、`note`、`data`。
 
 - 受け付けるのは `/organizations`・`/networks`・`/devices`・`/administered`
