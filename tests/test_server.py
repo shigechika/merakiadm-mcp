@@ -168,7 +168,7 @@ def test_security_events_counts_and_details():
 @respx.mock
 def test_security_events_marks_capped_pages():
     base_routes()
-    events = [{"occurredAt": _recent(5), "type": "client_ip_conflict"}] * 1000
+    events = [{"occurredAt": _recent(5), "type": "client_ip_conflict", "clientMac": f"aa:{i:04x}"} for i in range(1000)]
     respx.get(f"{BASE}/networks/N_1/events").mock(
         return_value=httpx.Response(200, json={"events": events}, headers={"Link": f"<{BASE}/networks/N_1/events?endingBefore=z>; rel=prev"})
     )
@@ -536,3 +536,29 @@ def test_daily_brief_stops_a_network_between_steps_after_the_limit(monkeypatch):
     assert "[DEVICES]" in text
     assert "the rest of this network was not checked" in text
     assert "[SECURITY]" not in text
+
+
+@respx.mock
+def test_repeated_events_are_folded_into_one_line():
+    base_routes()
+    same = {"type": "client_ip6_lla_conflict", "deviceName": "ap-1", "clientMac": "aa:01"}
+    events = [{**same, "occurredAt": _recent(m)} for m in (1, 2, 3)] + [{"type": "rogue_dhcp", "occurredAt": _recent(4)}]
+    respx.get(f"{BASE}/networks/N_1/events").mock(
+        side_effect=lambda request: httpx.Response(200, json={"events": events if request.url.params["productType"] == "wireless" else []})
+    )
+    text = server.security_events(hours=24, top=2)
+    assert "## Newest 4 of 4" in text
+    assert "back to" in text and "client_ip6_lla_conflict device=ap-1 client=aa:01 (x3)" in text
+    assert "rogue_dhcp" in text.split("## Newest", 1)[1]
+
+
+@respx.mock
+def test_unknown_event_types_get_a_hint():
+    base_routes()
+    respx.get(f"{BASE}/networks/N_1/events/eventTypes").mock(
+        return_value=httpx.Response(200, json=[{"category": "DHCP", "type": "rogue_dhcp", "description": "Rogue DHCP server"}])
+    )
+    respx.get(f"{BASE}/networks/N_1/events").mock(return_value=httpx.Response(200, json={"events": []}))
+    text = server.security_events(hours=24, event_types=["rogue_dhpc"])
+    assert "Not in this network's event type list, may match nothing: rogue_dhpc (did you mean rogue_dhcp?)" in text
+    assert "Not in this network" not in server.security_events(hours=24, event_types=["rogue_dhcp"])

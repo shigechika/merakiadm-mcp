@@ -80,6 +80,11 @@ online から落ちた回数、期間内に online でなかった分数、期�
 `stp_root_guard`、`stp_loop_guard`。`192.0.0.0/29` の IP の重複
 （464XLAT / CLAT）は別に数えます。
 
+`security_events` と `operational_events` の明細では、時刻だけが違う連続した
+イベントを 1 行にまとめ、`(xN)` と書きます。`event_types` に渡した名前が
+何にも当たらず、Dashboard がそのネットワークの種類の一覧にも載せていないときは、
+近い名前を添えて注意を出します。綴りを誤った種類には、API が何も返さないためです。
+
 ## operational_events
 
 | 引数 | 既定 | 範囲 |

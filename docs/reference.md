@@ -84,6 +84,11 @@ Default types: `multiple_dhcp_servers_detected`, `rogue_dhcp`,
 `stp_root_guard`, `stp_loop_guard`. IP conflicts on `192.0.0.0/29`
 (464XLAT/CLAT) are counted apart.
 
+In the detail lines of `security_events` and `operational_events`, neighbouring
+events that differ only in time are folded into one line with `(xN)`. An
+`event_types` name that matched nothing and that the Dashboard does not list
+for the network gets a note with close names, since the API answers a misspelt type with nothing.
+
 ## operational_events
 
 | Argument | Default | Range |

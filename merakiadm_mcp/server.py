@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import collections
 import datetime
+import difflib
 import functools
 import inspect
 import ipaddress
@@ -336,6 +337,38 @@ def _event_types(event_types: Optional[list[str]], default: tuple[str, ...] = SE
     if bad:
         raise ToolError(f"Invalid event type(s): {bad}")
     return list(event_types)
+
+
+def _known_event_types(net: dict) -> set[str]:
+    """Event type names the Dashboard lists for the network (empty when it cannot be read)."""
+
+    def load() -> set[str]:
+        try:
+            listed = _get_client().get(f"/networks/{net['id']}/events/eventTypes") or []
+        except Exception:  # noqa: BLE001 - only used for a hint
+            return set()
+        return {e["type"] for e in listed if isinstance(e, dict) and e.get("type")}
+
+    return _cached(f"eventtypes:{net['id']}", load)
+
+
+def _unknown_types_note(net: dict, event_types: Optional[list[str]], events: list[dict]) -> Optional[str]:
+    """A line naming requested types that matched nothing and that the Dashboard does not list.
+
+    Not a refusal: the list misses some types that do occur, and the API
+    silently matches nothing for a misspelt one.
+    """
+    seen = {e.get("type") for e in events}
+    asked = [t for t in event_types or [] if t not in seen]
+    known = _known_event_types(net) if asked else set()
+    unknown = [t for t in asked if known and t not in known]
+    if not unknown:
+        return None
+    hints = []
+    for name in unknown:
+        close = difflib.get_close_matches(name, known, n=2)
+        hints.append(name + (f" (did you mean {', '.join(close)}?)" if close else ""))
+    return "- Not in this network's event type list, may match nothing: " + "; ".join(hints)
 
 
 def _is_clat_conflict(ev: dict) -> bool:
@@ -678,12 +711,30 @@ def air_marshal(network: Optional[str] = None, hours: int = 1, top: int = 20) ->
 # --------------------------------------------------------------------------
 
 
+def _fold_repeats(event_lines: list[str]) -> list[tuple[str, str, str, int]]:
+    """Group consecutive lines that differ only in time: (newest time, oldest time, rest, count)."""
+    groups: list[list] = []
+    for line in event_lines:
+        date, clock, rest = (line[2:].split(" ", 2) + ["", ""])[:3]
+        if groups and groups[-1][2] == rest:
+            groups[-1][1] = f"{date} {clock}"
+            groups[-1][3] += 1
+        else:
+            groups.append([f"{date} {clock}", f"{date} {clock}", rest, 1])
+    return [tuple(g) for g in groups]
+
+
 def _newest(lines: list[str], events: list[dict], top: int, tz, ssids) -> None:
+    """The newest events, ``top`` lines at most, with identical neighbours folded into one line."""
     newest = sorted(events, key=lambda e: e.get("occurredAt") or "", reverse=True)
-    lines.append(f"\n## Newest {min(top, len(newest))} of {len(newest)}")
-    lines.extend(_event_line(e, tz, ssids) for e in newest[:top])
-    if len(newest) > top:
-        lines.append(f"- capped: {len(newest) - top} more not shown (raise top= or shorten hours=)")
+    groups = _fold_repeats([_event_line(e, tz, ssids) for e in newest])[:top]
+    shown = sum(g[3] for g in groups)
+    lines.append(f"\n## Newest {shown} of {len(newest)}")
+    for first, last, rest, count in groups:
+        when = first if first == last else f"{first} back to {last}"
+        lines.append(f"- {when} {rest}" + (f" (x{count})" if count > 1 else ""))
+    if len(newest) > shown:
+        lines.append(f"- capped: {len(newest) - shown} more not shown (raise top= or shorten hours=)")
 
 
 @mcp.tool()
@@ -722,6 +773,8 @@ def security_events(
         f"- Total: {len(collected):,}{_capped_note(capped)}",
         f"- By type: {_type_summary(collected)}",
     ]
+    if note := _unknown_types_note(net, event_types, collected):
+        lines.append(note)
     if clat:
         lines.append(f"- Not counted: {clat:,} client_ip_conflict on {CLAT_PREFIX} (464XLAT/CLAT clients share 192.0.0.2 by design)")
     if collected:
@@ -772,6 +825,8 @@ def operational_events(
         f"# Operational events — {net.get('name')} (last {hours}h)",
         f"- Total: {len(collected):,}{_capped_note(capped)}",
     ]
+    if note := _unknown_types_note(net, event_types, collected):
+        lines.append(note)
     for group in [*OPERATIONAL_EVENT_GROUPS, "other"]:
         if groups.get(group):
             lines.append(f"- {group}: {_top(groups[group], 10)}")
@@ -829,6 +884,8 @@ def list_events(
         f"# Events — {net.get('name')} ({product_type}, {len(events)} shown, "
         f"{_local(data.get('pageStartAt'), tz)} to {_local(data.get('pageEndAt'), tz)})",
     ]
+    if note := _unknown_types_note(net, event_types, events):
+        lines.append(note)
     lines.extend(_event_line(e, tz, ssids) for e in sorted(events, key=lambda e: e.get("occurredAt") or "", reverse=True))
     lines.append(f"\nolder_cursor: {older or '-'}")
     if older and not events:
