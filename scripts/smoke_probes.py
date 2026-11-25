@@ -85,6 +85,13 @@ PROBES: dict[str, Probe] = {
     "find_client": Probe(
         skip="needs a client MAC or IP, which this public file may not name; covered by the live checks before a release",
     ),
+    "config_changes": Probe(
+        args_factory=_single_network,
+        args={"hours": 24, "top": 3},
+        must_match=(r"^# Configuration changes — ",),
+        must_not_match=NO_ERROR,
+        timeout=120,
+    ),
     "air_marshal": Probe(
         args_factory=_single_network,
         args={"hours": 1, "top": 3},

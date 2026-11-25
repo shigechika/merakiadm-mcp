@@ -23,10 +23,13 @@ not healthy. When the key works it also lists `organization_list` and
 Per network: `[DEVICES]`, `[DEVICES-DOWN]`, `[AVAILABILITY]`, `[HEALTH]`,
 `[CONNECT]` / `[CONNECT-HIGH-FAILURE]` (with the previous window of the same
 length when `hours` is 84 or less) and `[CONNECT-TOP-AP]`, `[WIRELESS]`, `[SECURITY]`,
-`[OPERATIONS]` / `[OPERATIONS-WARN]`, `[LOG-DROPPED]`, `[UPLINK]` / `[UPLINK-DOWN]`, or
-`[API-ERROR]`. Each network is CRITICAL (API error), WARNING (device down now
+`[OPERATIONS]` / `[OPERATIONS-WARN]`, `[LOG-DROPPED]`, `[UPLINK]` / `[UPLINK-DOWN]`,
+`[CHANGES]` (count by administrator and page, no values), `[FIRMWARE]` (current
+versions and a scheduled upgrade), `[LICENSE]` / `[LICENSE-EXPIRING]` (once per
+organization, with its first network), or `[API-ERROR]`. Each network is CRITICAL (API error), WARNING (device down now
 or during the window, failures above the threshold, any security event, a
-warning-level operational event, an uplink down) or OK. Switch ports are only checked when the switch flags them
+warning-level operational event, an uplink down, a license that is not active
+or ends within 30 days) or OK. Switch ports are only checked when the switch flags them
 as uplinks. `[WIRELESS]` (packet loss, the worst access points by upstream loss, the
 busiest channel, access points with no traffic) is informational and never changes
 the tier; when it cannot be read it says `not read`. At most 25 networks, and only those started within 40 seconds, are checked
@@ -63,6 +66,22 @@ window, per band and for the busiest radios, split into Wi-Fi and non-Wi-Fi
 (interference); the access points with the highest average best-effort
 latency (only those with at least 100 samples). Loss below 0.1% is shown as
 `<0.1%`, never `0.0%`.
+
+## config_changes
+
+| Argument | Default | Range |
+|---|---|---|
+| `network` | the only network in scope | name or ID |
+| `hours` | 168 | 1-744 (31 days) |
+| `top` | 30 | 1-100 entries |
+
+The organization's change log for the network and organization-wide entries:
+counts by administrator and by page, then the newest entries with time,
+administrator, network or SSID, page, label and old → new value (shortened).
+When the label or page names a secret (PSK, password, community, key…), the
+old and new values are `[redacted]`; `api_get` does the same for any
+change-log entry. The endpoint keeps offering a next page that repeats the
+last entry, so reading stops when a page adds nothing new.
 
 ## availability_history
 

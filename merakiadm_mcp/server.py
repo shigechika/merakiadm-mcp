@@ -1399,6 +1399,166 @@ def find_client(query: str, network: Optional[str] = None, hours: int = 1, top: 
 
 
 # --------------------------------------------------------------------------
+# configuration changes, firmware, licensing
+# --------------------------------------------------------------------------
+
+MAX_CHANGE_HOURS = 744  # 31 days
+_CHANGES_CAPPED = " (capped: older entries in the window not read; shorten hours=)"
+
+
+def _org_changes(org_id: str, hours: int) -> tuple[list[dict], bool]:
+    """Change-log entries of the organization in the window, secrets masked, newest first."""
+
+    def load():
+        # The endpoint keeps offering a next page past the last entry, and that page repeats
+        # the newest entry: stop when a page adds nothing new.
+        query: dict[str, Any] = {"timespan": hours * 3600, "perPage": 1000}
+        rows: list[dict] = []
+        seen: set[str] = set()
+        capped = False
+        for index in range(10):
+            page = _get_client().page(f"/organizations/{org_id}/configurationChanges", query)
+            fresh = []
+            for r in page.data or []:
+                key = json.dumps(r, sort_keys=True, default=str)
+                if key not in seen:
+                    seen.add(key)
+                    fresh.append(r)
+            rows.extend(fresh)
+            nxt = page.links.get("next")
+            if not fresh or not nxt:
+                break
+            query = {"timespan": hours * 3600, "perPage": 1000, **nxt}
+            capped = index == 9
+        rows = _redact(rows, [0])
+        rows.sort(key=lambda r: str(r.get("ts") or ""), reverse=True)
+        return rows, capped
+
+    return _cached(f"changes:{org_id}:{hours}", load)
+
+
+def _changes_for(net: dict, rows: list[dict]) -> list[dict]:
+    """Entries of this network, plus organization-wide ones (no network)."""
+    return [r for r in rows if r.get("networkId") in (None, "", net["id"])]
+
+
+def _short(value: Any, limit: int = 100) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit] + f"… ({len(text)} chars)"
+
+
+@mcp.tool()
+def config_changes(network: Optional[str] = None, hours: int = 168, top: int = 30) -> str:
+    """Who changed what in the Dashboard, and when.
+
+    Reads the organization's change log for the window: entries of the
+    network and organization-wide ones (administrators, licensing...). Shows
+    counts by administrator and by page, then the newest ``top`` entries with
+    the old and new value, shortened. Values of entries whose label names a
+    secret (PSK, RADIUS secret, SNMP community...) are "[redacted]".
+
+    Args:
+        network: Network name or ID; may be omitted when only one is in scope.
+        hours: Look-back window, 1-744 (31 days; default 168).
+        top: How many entries to list (1-100, default 30).
+    """
+    net = _one_network(network)
+    hours = _bound(hours, 1, MAX_CHANGE_HOURS)
+    top = _bound(top, 1, 100)
+    tz = _tz(net)
+    rows, capped = _org_changes(net["organizationId"], hours)
+    rows = _changes_for(net, rows)
+    lines = [f"# Configuration changes — {net.get('name')} (last {hours}h)"]
+    lines.append(f"- Entries: {len(rows):,} ({sum(1 for r in rows if not r.get('networkId')):,} organization-wide){_CHANGES_CAPPED if capped else ''}")
+    if not rows:
+        return "\n".join(lines)
+    lines.append(f"- By administrator: {_top(collections.Counter(r.get('adminName') or r.get('adminId') or '?' for r in rows), 10)}")
+    lines.append(f"- By page: {_top(collections.Counter(r.get('page') or '?' for r in rows), 10)}")
+    lines.append(f"\n## Newest {min(top, len(rows))} of {len(rows)}")
+    for r in rows[:top]:
+        where = r.get("networkName") or "organization"
+        if r.get("ssidName"):
+            where += f" / SSID {r['ssidName']}"
+        lines.append(
+            f"- {_local(r.get('ts'), tz)} {r.get('adminName') or '?'} — {where} — {r.get('page')}: {r.get('label')}: "
+            f"{_short(r.get('oldValue'))} → {_short(r.get('newValue'))}"
+        )
+    if len(rows) > top:
+        lines.append(f"- capped: {len(rows) - top} more entries not listed (raise top= or shorten hours=)")
+    return "\n".join(lines)
+
+
+def _changes_line(net: dict, hours: int, top: int) -> str:
+    try:
+        rows, capped = _org_changes(net["organizationId"], hours)
+    except MerakiAPIError as exc:
+        return f"- [CHANGES] not read: {exc}"
+    rows = _changes_for(net, rows)
+    if not rows:
+        return f"- [CHANGES] none{_CHANGES_CAPPED if capped else ''}"
+    org_wide = sum(1 for r in rows if not r.get("networkId"))
+    return (
+        f"- [CHANGES] {len(rows):,} ({org_wide:,} organization-wide) by "
+        + _top(collections.Counter(r.get("adminName") or "?" for r in rows), top)
+        + "; pages: "
+        + _top(collections.Counter(r.get("page") or "?" for r in rows), top)
+        + f"{_CHANGES_CAPPED if capped else ''} — see config_changes"
+    )
+
+
+def _firmware_line(net: dict, tz: datetime.tzinfo) -> str:
+    try:
+        products = (_get_client().get(f"/networks/{net['id']}/firmwareUpgrades") or {}).get("products") or {}
+    except MerakiAPIError as exc:
+        return f"- [FIRMWARE] not read: {exc}"
+    parts = []
+    for product, info in sorted(products.items()):
+        current = (info.get("currentVersion") or {}).get("shortName") or "?"
+        nxt = info.get("nextUpgrade") or {}
+        when = nxt.get("time")
+        target = (nxt.get("toVersion") or {}).get("shortName")
+        parts.append(f"{product} {current}" + (f", upgrade to {target or '?'} at {_local(when, tz)}" if when else ""))
+    return "- [FIRMWARE] " + ("; ".join(parts) if parts else "no product reported")
+
+
+def _license_line(org: dict, warn_days: int = 30) -> tuple[str, bool]:
+    """(the [LICENSE] line, whether it warrants a WARNING)."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        if ((org.get("licensing") or {}).get("model")) == "subscription":
+            subs = _get_client().get(
+                "/administered/licensing/subscription/subscriptions", {"organizationIds[]": [str(org["id"])]}
+            ) or []
+            if not subs:
+                return "- [LICENSE] no subscription found", False
+            parts, warn = [], False
+            for sub in subs:
+                end = _parse_ts(sub.get("endDate"))
+                days = (end - now).days if end else None
+                seats = ((sub.get("counts") or {}).get("seats")) or {}
+                bad = sub.get("status") != "active" or (days is not None and days <= warn_days)
+                warn = warn or bad
+                parts.append(
+                    f"{sub.get('name') or sub.get('subscriptionId')} {sub.get('status')}"
+                    + (f" until {end:%Y-%m-%d} ({days} days)" if end else "")
+                    + (f", seats {seats.get('assigned')}/{seats.get('limit')}" if seats else "")
+                )
+            return f"- [LICENSE{'-EXPIRING' if warn else ''}] " + "; ".join(parts), warn
+        overview = _get_client().get(f"/organizations/{org['id']}/licenses/overview") or {}
+        end = _parse_ts(overview.get("expirationDate"))
+        days = (end - now).days if end else None
+        warn = overview.get("status") not in (None, "OK") or (days is not None and days <= warn_days)
+        return (
+            f"- [LICENSE{'-EXPIRING' if warn else ''}] {overview.get('status')}"
+            + (f" until {end:%Y-%m-%d} ({days} days)" if end else ""),
+            warn,
+        )
+    except MerakiAPIError as exc:
+        return f"- [LICENSE] not read: {exc}", False
+
+
+# --------------------------------------------------------------------------
 # switch uplinks
 # --------------------------------------------------------------------------
 
@@ -1437,6 +1597,9 @@ _SERIAL_KEY = re.compile(r"(^serial|Serial)$")
 API_PAGES_SECONDS = 20.0  # no further page is started after this; a page itself may take up to the client timeout
 NOTE_CAPPED = "part of the answer was left out: use fields=, offset=/limit= or narrower params"
 REDACTED = "[redacted]"
+_CHANGE_VALUE_KEYS = ("oldValue", "newValue")
+#: A change-log label or page naming a secret: its old and new values are masked.
+_SECRET_LABEL = re.compile(r"(?i)psk|secret|passw|passphrase|communit|token|credential|key")
 #: A key is secret when its lower-cased name contains one of these. Booleans stay.
 _SECRET_KEY = re.compile(
     r"psk|secret|passw|passphrase|communit|token|credential|licensekey|apikey|privatekey|presharedkey"
@@ -1621,11 +1784,22 @@ def find_api(query: str, top: int = 10) -> str:
 
 
 def _redact(node: Any, counter: list[int]) -> Any:
-    """Replace the values of secret-looking keys, also inside JSON carried in strings."""
+    """Replace the values of secret-looking keys, also inside JSON carried in strings.
+
+    A change-log entry keeps its values under generic keys (``oldValue`` /
+    ``newValue``); those are masked when the entry's label or page names a
+    secret (e.g. label "Ssid psk").
+    """
     if isinstance(node, dict):
         out = {}
+        secret_entry = any(k in node for k in _CHANGE_VALUE_KEYS) and any(
+            isinstance(node.get(k), str) and _SECRET_LABEL.search(node[k]) for k in ("label", "page", "name")
+        )
         for k, v in node.items():
-            if _SECRET_KEY.search(str(k).lower()) and v not in (None, "") and not isinstance(v, bool):
+            if secret_entry and k in _CHANGE_VALUE_KEYS and v not in (None, "") and not isinstance(v, bool):
+                counter[0] += 1
+                out[k] = REDACTED
+            elif _SECRET_KEY.search(str(k).lower()) and v not in (None, "") and not isinstance(v, bool):
                 counter[0] += 1
                 out[k] = REDACTED
             else:
@@ -2045,6 +2219,10 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
     - [OPERATIONS] rare operational events: reboots, RADIUS/DHCP trouble,
       radar, attacks, switch faults, dropped log entries (see operational_events)
     - [UPLINK] switch ports flagged as uplinks that are not connected
+    - [CHANGES] configuration changes by administrator and page, without
+      values (see config_changes); [FIRMWARE] current versions and any
+      scheduled upgrade; [LICENSE] subscription or license end date, with
+      the organization's first network
 
     At most 25 networks, and only those started within 40 seconds, are
     checked per call; the rest are counted as capped. A network still
@@ -2056,7 +2234,8 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
                  connection failures above ``failure_threshold`` percent,
                  any security event, a warning-level operational event
                  (reboot, RADIUS timeout, DHCP pool exhausted, attack,
-                 hardware or port fault), or an uplink down
+                 hardware or port fault), an uplink down, or a license
+                 that is not active or ends within 30 days
     - OK       — none of the above
 
     Args:
@@ -2075,6 +2254,7 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
     nets = nets[:MAX_BRIEF_NETWORKS]
 
     sections: list[tuple[str, list[str]]] = []
+    licensed: set[str] = set()  # the [LICENSE] line is per organization: shown with its first network
     started = time.monotonic()
     for index, net in enumerate(nets):
         if index and time.monotonic() - started > BRIEF_TIME_BUDGET:
@@ -2183,6 +2363,17 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
                     body.append(f"- [UPLINK] {len(switches)} switches, {uplinks} uplink ports, none down{' (capped)' if more else ''}")
                 else:
                     body.append(f"- [UPLINK] {len(switches)} switches, no port is flagged as an uplink (not checked){' (capped)' if more else ''}")
+
+            step()
+            body.append(_changes_line(net, hours, top))
+            body.append(_firmware_line(net, _tz(net)))
+            if org_id not in licensed:
+                licensed.add(org_id)
+                org = next((o for o in _organizations() if str(o.get("id")) == str(org_id)), {"id": org_id})
+                line, warn = _license_line(org)
+                body.append(line)
+                if warn:
+                    tier = "WARNING"
         except _BriefTimeUp:
             body.append(f"- capped: the brief reached {BRIEF_STEP_LIMIT:.0f} s; the rest of this network was not checked")
         except Exception as exc:  # noqa: BLE001

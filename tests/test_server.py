@@ -261,6 +261,19 @@ def daily_routes(stats, events=(), ports=None, avail=None, changes=(), ops=(), p
         return_value=httpx.Response(200, json={"items": ports if ports is not None else [{"name": "sw-1", "ports": [{"portId": "49", "isUplink": True, "status": "Connected", "enabled": True}]}], "meta": {}})
     )
     wireless_routes()
+    respx.get(f"{BASE}/organizations/100/configurationChanges").mock(return_value=httpx.Response(200, json=CHANGES))
+    respx.get(f"{BASE}/networks/N_1/firmwareUpgrades").mock(return_value=httpx.Response(200, json={"products": {
+        "wireless": {"currentVersion": {"shortName": "MR 31.1"}, "nextUpgrade": {"time": "2026-12-01T18:00:00Z", "toVersion": {"shortName": "MR 31.2"}}},
+        "switch": {"currentVersion": {"shortName": "MS 18.1"}, "nextUpgrade": {"time": "", "toVersion": {}}},
+    }}))
+    respx.get(f"{BASE}/organizations/100/licenses/overview").mock(return_value=httpx.Response(200, json={"status": "OK", "expirationDate": "2099-01-01T00:00:00Z"}))
+
+
+CHANGES = [
+    {"ts": "2026-11-25T01:00:00Z", "adminName": "alice", "networkId": "N_1", "networkName": "Example Net", "ssidName": "CorpNet", "page": "Access control", "label": "Ssid psk", "oldValue": "s1", "newValue": "s2"},
+    {"ts": "2026-11-25T02:00:00Z", "adminName": "bob", "networkId": None, "page": "Administrators", "label": "Create admin", "oldValue": "", "newValue": "x" * 300},
+    {"ts": "2026-11-25T03:00:00Z", "adminName": "bob", "networkId": "N_9", "page": "Other", "label": "Elsewhere", "oldValue": "a", "newValue": "b"},
+]
 
 
 def loss_rows():
@@ -307,6 +320,9 @@ def test_daily_brief_ok():
     assert "[WIRELESS] packet loss client to AP (upstream) 20.1% of 10,050" in text
     assert "worst upstream: ap-1 20.0%;" in text  # ap-2 carried too few packets to rank
     assert "busiest channel: ap-1 2.4 GHz 45.0%" in text and "no traffic: ap-3" in text
+    assert "[CHANGES] 2 (1 organization-wide) by bob 1, alice 1; pages: Administrators 1, Access control 1" in text
+    assert "[FIRMWARE] switch MS 18.1; wireless MR 31.1, upgrade to MR 31.2 at 12-02 03:00" in text
+    assert "[LICENSE] OK until 2099-01-01" in text and "s2" not in text
 
 
 @respx.mock
@@ -940,3 +956,51 @@ def test_find_client_by_ip_reads_further_pages_for_the_exact_address():
         if r.url.params.get("startingAfter") else httpx.Response(200, json=[{"id": "k1", "mac": "m1", "ip": "10.0.0.95"}], headers={"Link": link}))
     respx.get(f"{BASE}/networks/N_1/clients/k2").mock(return_value=httpx.Response(200, json={"id": "k2", "mac": "m2", "ip": "10.0.0.9"}))
     assert "IP 10.0.0.9," in server.find_client("10.0.0.9")
+
+
+def test_change_log_values_are_masked_when_the_label_names_a_secret():
+    rows = [
+        {"page": "Access control", "label": "Ssid psk", "oldValue": "old-secret", "newValue": "new-secret"},
+        {"page": "SNMP", "label": "Community string", "oldValue": "c1", "newValue": "c2"},
+        {"page": "Access Points", "label": "Device address", "oldValue": "a", "newValue": "b"},
+    ]
+    counter = [0]
+    out = server._redact(rows, counter)
+    assert out[0]["oldValue"] == out[0]["newValue"] == out[1]["newValue"] == "[redacted]"
+    assert out[2]["newValue"] == "b" and counter[0] == 4
+
+
+@respx.mock
+def test_config_changes_lists_entries_with_secrets_masked():
+    daily_routes({})
+    text = server.config_changes(hours=48, top=5)
+    assert "Entries: 2 (1 organization-wide)" in text and "Elsewhere" not in text
+    assert "alice — Example Net / SSID CorpNet — Access control: Ssid psk: [redacted] → [redacted]" in text
+    assert "… (300 chars)" in text
+
+
+@respx.mock
+def test_daily_brief_warns_on_a_subscription_ending_soon():
+    daily_routes({"assoc": 0, "auth": 0, "dhcp": 0, "dns": 0, "success": 10})
+    respx.get(f"{BASE}/organizations").mock(return_value=httpx.Response(200, json=[{**ORG, "licensing": {"model": "subscription"}}]))
+    soon = _recent(-60 * 24 * 10)
+    respx.get(f"{BASE}/administered/licensing/subscription/subscriptions").mock(return_value=httpx.Response(200, json=[
+        {"name": "SUB1", "status": "active", "endDate": soon, "counts": {"seats": {"assigned": 3, "limit": 5}}}]))
+    text = server.daily_brief(hours=24, failure_threshold=10.0, top=3)
+    assert "[LICENSE-EXPIRING] SUB1 active until" in text and "seats 3/5" in text and "1 WARNING" in text
+
+
+def test_config_changes_says_capped(monkeypatch):
+    monkeypatch.setattr(server, "_one_network", lambda n: NET)
+    monkeypatch.setattr(server, "_org_changes", lambda org, h: ([dict(CHANGES[0])], True))
+    assert "capped: older entries in the window not read" in server.config_changes()
+
+
+@respx.mock
+def test_change_log_paging_stops_when_a_page_only_repeats():
+    base_routes()
+    link = {"Link": f'<{BASE}/organizations/100/configurationChanges?startingAfter=z>; rel=next'}
+    respx.get(f"{BASE}/organizations/100/configurationChanges").mock(side_effect=lambda r: httpx.Response(200, json=CHANGES[1:2], headers=link)
+        if r.url.params.get("startingAfter") else httpx.Response(200, json=CHANGES, headers=link))
+    rows, capped = server._org_changes("100", 24)
+    assert len(rows) == 3 and capped is False

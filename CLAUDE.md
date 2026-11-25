@@ -25,9 +25,9 @@ MERAKI_DASHBOARD_API_KEY=... .venv/bin/python scripts/smoke_test.py   # live smo
   `meraki.com` hosts (httpx drops the
   Authorization header on cross-host redirects). 429 and 5xx are retried with
   `Retry-After` within a retry budget. httpx/httpcore logging is held at WARNING.
-- `merakiadm_mcp/server.py` — `MCPServer` with 13 tools: `health_check`,
+- `merakiadm_mcp/server.py` — `MCPServer` with 14 tools: `health_check`,
   `daily_brief`, `connection_failures`, `wireless_quality`, `availability_history`, `air_marshal`,
-  `security_events`, `operational_events`, `list_events`, `resolve_entity`,
+  `security_events`, `operational_events`, `list_events`, `config_changes`, `resolve_entity`,
   `find_client`, and the generic pair `find_api` (searches the org's own
   OpenAPI spec, cached 6 h in memory and in the user cache directory) / `api_get`. Event type sets
   live in `SECURITY_EVENT_TYPES` and `OPERATIONAL_EVENT_GROUPS` (the latter
@@ -60,7 +60,11 @@ MERAKI_DASHBOARD_API_KEY=... .venv/bin/python scripts/smoke_test.py   # live smo
   (`pageStartAt`), and `prev` is offered forever, a month at a time, even
   past the oldest event: `_read_events` is capped only when `pageStartAt`
   is inside the window, and `list_events` treats an empty page as the end. Availability change history answers newest first and
-  its `next` link pins `t0`/`t1`; `get_all` drops `timespan` then.
+  its `next` link pins `t0`/`t1`; `get_all` drops `timespan` then. The
+  change log (`configurationChanges`) keeps offering a `next` page that repeats
+  the last entry: `_org_changes` stops when a page adds nothing new. Its values
+  sit under generic keys (`oldValue` / `newValue`), so `_redact` masks them when
+  the label or page names a secret (label "Ssid psk" is a real PSK).
 - `events_dropped2` is an access point reporting it dropped `n` events of a
   high-volume type (`eventData.type`); it is reported as `[LOG-DROPPED]`,
   never as an operational event.

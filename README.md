@@ -33,7 +33,7 @@ All tools are read-only (GET only) and annotated `readOnlyHint`.
 | Tool | What it answers |
 |---|---|
 | `health_check` | Server version, API key validity, organizations and networks in scope, device counts by status |
-| `daily_brief` | One-shot morning check of every network over the last 24 h: devices offline now or during the window, health alerts, connection success rate compared with the previous window, wireless packet loss and channel use, security and operational events, switch uplinks; CRITICAL / WARNING / OK |
+| `daily_brief` | One-shot morning check of every network over the last 24 h: devices offline now or during the window, health alerts, connection success rate compared with the previous window, wireless packet loss and channel use, security and operational events, switch uplinks, configuration changes, firmware, license end date; CRITICAL / WARNING / OK |
 | `connection_failures` | Failed wireless connections aggregated by step (assoc/auth/dhcp/dns), type, SSID, VLAN, access point and hour |
 | `wireless_quality` | Packet loss in each direction, access points with no traffic, channel utilization per band (Wi-Fi and non-Wi-Fi), best-effort latency; the worst access points of each |
 | `air_marshal` | Neighbouring SSIDs: totals, SSIDs seen on your wired LAN (rogues), SSIDs using one of your SSID names |
@@ -41,6 +41,7 @@ All tools are read-only (GET only) and annotated `readOnlyHint`.
 | `security_events` | Rogue/duplicate DHCP servers, AP spoofing, rogue AP association, IP/IPv6 conflicts, RA guard, loops, STP guards |
 | `operational_events` | Rare operational events: reboots, RADIUS timeouts, DHCP pool exhaustion, radar, wireless attacks, switch hardware/config/port faults, dropped log entries |
 | `list_events` | One page of the event log with an `older_cursor` to continue and a `complete` flag |
+| `config_changes` | Who changed what and when: counts by administrator and page, the newest entries with old and new values (secret values masked) |
 | `resolve_entity` | Organization, network and device IDs from a name, serial, MAC or LAN IP |
 | `find_client` | A client by MAC, IP or user/description: its record, last AP or switch port, and its wireless connections, events per AP with signal, latest problems, latency |
 | `find_api` | Search the Dashboard's read (GET) operations by English keywords, or show one operation's parameters |
