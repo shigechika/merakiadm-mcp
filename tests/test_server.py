@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -636,3 +637,125 @@ def test_unknown_event_types_get_a_hint():
     text = server.security_events(hours=24, event_types=["rogue_dhpc"])
     assert "Not in this network's event type list, may match nothing: rogue_dhpc (did you mean rogue_dhcp?)" in text
     assert "Not in this network" not in server.security_events(hours=24, event_types=["rogue_dhcp"])
+
+
+SPEC = {
+    "openapi": "3.0.1",
+    "paths": {
+        "/networks/{networkId}/wireless/ssids": {"get": {"operationId": "getNetworkWirelessSsids", "summary": "List the MR SSIDs in a network", "tags": ["wireless"], "parameters": [{"name": "networkId", "in": "path", "required": True, "schema": {"type": "string"}}]}},
+        "/organizations/{organizationId}/devices/statuses": {"get": {"operationId": "getOrganizationDevicesStatuses", "summary": "List the status of every device", "tags": ["organizations"], "parameters": [{"name": "networkIds", "in": "query", "schema": {"type": "array", "items": {"type": "string"}}, "description": "Filter by network"}, {"name": "perPage", "in": "query", "schema": {"type": "integer"}}]}},
+        "/organizations/{organizationId}/admins": {"get": {"operationId": "getOrganizationAdmins", "summary": "List the dashboard administrators", "tags": ["organizations"], "parameters": []}},
+        "/networks/{networkId}/snmp": {"get": {"operationId": "getNetworkSnmp", "summary": "Return the SNMP settings for a network", "tags": ["networks"]}, "put": {"operationId": "updateNetworkSnmp"}},
+    },
+}
+
+
+def spec_route():
+    return respx.get(f"{BASE}/organizations/100/openapiSpec").mock(return_value=httpx.Response(200, json=SPEC))
+
+
+@respx.mock
+def test_find_api_searches_and_describes_get_operations():
+    base_routes()
+    spec_route()
+    text = server.find_api("wireless ssids")
+    assert text.splitlines()[1].startswith("- getNetworkWirelessSsids — GET /networks/{networkId}/wireless/ssids")
+    assert "updateNetworkSnmp" not in server.find_api("snmp")
+    detail = server.find_api("getOrganizationDevicesStatuses")
+    assert "query `networkIds[]` (array of string)" in detail and "Filter by network" in detail
+    assert server.find_api("/networks/N_1/wireless/ssids").startswith("# getNetworkWirelessSsids")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "https://evil.example/api",
+        "http://evil.example/api",
+        "//evil.example/api",
+        "evil.example/api",
+        "/networks/N_1/../../x",
+        "/networks/N_1/%2e%2e/x",
+        "/networks/N_1/ssids?x=1",
+        "/networks/N_1#frag",
+        "/networks/N_1/a b",
+        "/networks/user@evil.example",
+        "/other/thing",
+        "/networks/{networkId}/wireless/ssids",
+    ],
+)
+@respx.mock
+def test_api_get_refuses_paths_that_could_leave_the_api(path):
+    base_routes()
+    with pytest.raises(ToolError):
+        server.api_get(path)
+    assert not [c for c in respx.calls if "evil" in str(c.request.url) or "/other" in str(c.request.url)]
+
+
+@respx.mock
+def test_api_get_stays_in_scope(monkeypatch):
+    other = {**NET, "id": "N_2", "name": "other net"}
+    base_routes(nets=(NET, other))
+    monkeypatch.setenv("MERAKI_NETWORK_IDS", "N_1")
+    respx.get(f"{BASE}/organizations/100/devices").mock(return_value=httpx.Response(200, json=[{**d, "networkId": "N_1"} for d in DEVICES] + [{"serial": "Q-X", "networkId": "N_2"}]))
+    spec_route()
+    with pytest.raises(ToolError, match="network N_2 is not in scope"):
+        server.api_get("/networks/N_2/wireless/ssids")
+    with pytest.raises(ToolError, match="organization 999 is not in scope"):
+        server.api_get("/organizations/999/admins")
+    with pytest.raises(ToolError, match="device Q-X is not in a network in scope"):
+        server.api_get("/devices/Q-X")
+    with pytest.raises(ToolError, match="cannot be narrowed"):
+        server.api_get("/organizations/100/admins")
+    with pytest.raises(ToolError, match="network N_2 is not in scope"):
+        server.api_get("/organizations/100/devices/statuses", params={"networkIds": ["N_2"]})
+    statuses = respx.get(f"{BASE}/organizations/100/devices/statuses").mock(return_value=httpx.Response(200, json=[]))
+    server.api_get("/organizations/100/devices/statuses")
+    assert statuses.calls[0].request.url.params.get_list("networkIds[]") == ["N_1"]
+    device = respx.get(f"{BASE}/devices/Q-AP1").mock(return_value=httpx.Response(200, json={"serial": "Q-AP1"}))
+    assert server.api_get("/devices/Q-AP1")["data"] == {"serial": "Q-AP1"} and device.called
+
+
+@respx.mock
+def test_api_get_masks_secrets_before_shaping():
+    base_routes()
+    ssids = [
+        {"number": 0, "name": "CorpNet", "psk": "hunter2", "authMode": "psk", "radiusServers": [{"host": "10.0.0.1", "secret": "s3"}], "radiusEnabled": True, "encryptionMode": None},
+        {"number": 1, "name": "Guest", "notes": '{"wpaPassphrase": "p4"}', "snmpCommunity": ""},
+    ]
+    respx.get(f"{BASE}/networks/N_1/wireless/ssids").mock(return_value=httpx.Response(200, json=ssids))
+    result = server.api_get("/networks/N_1/wireless/ssids", fields=["name", "psk", "radiusServers.secret", "radiusServers.host", "notes"])
+    text = str(result)
+    assert "hunter2" not in text and "s3" not in text and "p4" not in text
+    assert result["redacted"] == 3
+    assert result["data"][0] == {"name": "CorpNet", "psk": "[redacted]", "radiusServers": [{"host": "10.0.0.1", "secret": "[redacted]"}]}
+
+
+@respx.mock
+def test_api_get_bounds_a_huge_list_and_returns_paging_params():
+    base_routes()
+    rows = [{"mac": f"aa:{i:04x}", "ssid": "x" * 400, "bssids": [{"bssid": f"b{j}"} for j in range(30)]} for i in range(500)]
+    link = f'<{BASE}/networks/N_1/wireless/airMarshal?startingAfter=abc&perPage=500>; rel=next'
+    respx.get(f"{BASE}/networks/N_1/wireless/airMarshal").mock(return_value=httpx.Response(200, json=rows, headers={"Link": link}))
+    result = server.api_get("/networks/N_1/wireless/airMarshal", params={"timespan": 3600}, limit=200, max_chars=8000)
+    assert result["total_items"] == 500 and result["capped"] is True
+    assert len(json.dumps(result)) <= 8000
+    assert result["next_params"] == {"startingAfter": "abc"}
+    assert result["data"][0]["bssids"][-1].endswith("more items")
+
+
+@respx.mock
+def test_api_get_lists_only_organizations_in_scope(monkeypatch):
+    respx.get(f"{BASE}/organizations").mock(return_value=httpx.Response(200, json=[ORG, {"id": "200", "name": "Other"}]))
+    monkeypatch.setenv("MERAKI_ORG_ID", "100")
+    result = server.api_get("/organizations", fields=["id"])
+    assert result["data"] == [{"id": "100"}] and result["total_items"] == 1
+
+
+@respx.mock
+def test_api_get_windows_the_list_inside_an_object():
+    base_routes()
+    body = {"message": None, "pageStartAt": "x", "events": [{"type": "boot", "n": i} for i in range(30)]}
+    respx.get(f"{BASE}/networks/N_1/events").mock(return_value=httpx.Response(200, json=body))
+    result = server.api_get("/networks/N_1/events", fields=["n"], offset=5, limit=3)
+    assert result["list_key"] == "events" and result["total_items"] == 30 and result["capped"] is True
+    assert result["data"] == {"message": None, "pageStartAt": "x", "events": [{"n": 5}, {"n": 6}, {"n": 7}]}

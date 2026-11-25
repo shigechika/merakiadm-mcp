@@ -199,10 +199,10 @@ def _get_client() -> MerakiClient:
     return _client
 
 
-def _cached(key: str, loader):
+def _cached(key: str, loader, ttl: float = CACHE_SECONDS):
     hit = _cache.get(key)
     now = time.monotonic()
-    if hit and now - hit[0] < CACHE_SECONDS:
+    if hit and now - hit[0] < ttl:
         return hit[1]
     value = loader()
     _cache[key] = (now, value)
@@ -266,14 +266,19 @@ def _one_network(network: Optional[str]) -> dict:
     return nets[0]
 
 
-def _device_names(org_id: str) -> tuple[dict[str, str], bool]:
-    """(serial -> device name, capped). Unread devices fall back to their serial."""
+def _devices(org_id: str) -> tuple[list[dict], bool]:
+    """(device inventory of the organization, capped)."""
 
     def load():
-        devices, capped = _get_client().get_all(f"/organizations/{org_id}/devices", {"perPage": 1000}, max_pages=50)
-        return {d["serial"]: d.get("name") or d["serial"] for d in devices if d.get("serial")}, capped
+        return _get_client().get_all(f"/organizations/{org_id}/devices", {"perPage": 1000}, max_pages=50)
 
     return _cached(f"devices:{org_id}", load)
+
+
+def _device_names(org_id: str) -> tuple[dict[str, str], bool]:
+    """(serial -> device name, capped). Unread devices fall back to their serial."""
+    devices, capped = _devices(org_id)
+    return {d["serial"]: d.get("name") or d["serial"] for d in devices if d.get("serial")}, capped
 
 
 NAMES_CAPPED = "capped: the device inventory was not read to the end; some devices are shown by serial"
@@ -1199,6 +1204,378 @@ def _uplink_problems(switches: list[dict]) -> tuple[int, list[str]]:
             if port.get("enabled", True) and port.get("status") != "Connected":
                 problems.append(f"{sw.get('name') or sw.get('serial')} port {port.get('portId')} {port.get('status')}")
     return uplinks, problems
+
+
+# --------------------------------------------------------------------------
+# any GET operation: find_api / api_get
+# --------------------------------------------------------------------------
+
+API_ROOTS = ("organizations", "networks", "devices", "administered")
+_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.:~-]{1,128}$")
+_PARAM_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}(\[\])?$")
+API_INDEX_SECONDS = 6 * 3600
+API_MAX_CHARS = 20_000
+REDACTED = "[redacted]"
+#: A key is secret when its lower-cased name contains one of these. Booleans stay.
+_SECRET_KEY = re.compile(
+    r"psk|secret|passw|passphrase|communit|token|credential|licensekey|apikey|privatekey|presharedkey"
+    r"|sharedkey|authkey|eapolkey|md5authenticationkey|pass$|key$"
+)
+
+
+def _api_index() -> list[dict]:
+    """GET operations of the Dashboard API, from the organization's own OpenAPI spec (cached)."""
+
+    def load():
+        spec = _get_client().get(f"/organizations/{_organizations()[0]['id']}/openapiSpec", {"version": 3}) or {}
+        ops = []
+        for path, methods in (spec.get("paths") or {}).items():
+            op = (methods or {}).get("get")
+            if not isinstance(op, dict):
+                continue
+            params = []
+            for prm in op.get("parameters") or []:
+                if not isinstance(prm, dict) or "name" not in prm:
+                    continue
+                schema = prm.get("schema") or {}
+                kind = schema.get("type") or ""
+                if kind == "array":
+                    kind = f"array of {(schema.get('items') or {}).get('type') or 'value'}"
+                params.append(
+                    {
+                        "name": prm["name"],
+                        "in": prm.get("in"),
+                        "required": bool(prm.get("required")),
+                        "type": kind,
+                        "enum": schema.get("enum") or (schema.get("items") or {}).get("enum"),
+                        "description": " ".join(str(prm.get("description") or "").split())[:200],
+                    }
+                )
+            ops.append(
+                {
+                    "id": op.get("operationId") or "",
+                    "path": path,
+                    "summary": " ".join(str(op.get("summary") or "").split()),
+                    "description": " ".join(str(op.get("description") or "").split())[:600],
+                    "tags": [str(t) for t in op.get("tags") or []],
+                    "params": params,
+                    "regex": re.compile("^" + re.sub(r"\\\{[^/]+?\\\}", "[^/]+", re.escape(path)) + "$"),
+                }
+            )
+        if not ops:
+            raise ToolError("the Dashboard returned no OpenAPI operations")
+        return ops
+
+    return _cached("api-index", load, API_INDEX_SECONDS)
+
+
+def _words(text: str) -> set[str]:
+    """Lower-case words of a text, splitting camelCase and punctuation."""
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+    return {w for w in re.split(r"[^A-Za-z0-9]+", text.lower()) if w}
+
+
+def _match_operation(path: str) -> Optional[dict]:
+    """The GET operation whose template matches a concrete path, preferring the most literal one."""
+    hits = [op for op in _api_index() if op["regex"].match(path)]
+    return max(hits, key=lambda op: op["path"].count("/") - op["path"].count("{")) if hits else None
+
+
+def _describe_operation(op: dict) -> str:
+    lines = [f"# {op['id']} — GET {op['path']}", f"- {op['summary']}"]
+    if op["description"] and op["description"] != op["summary"]:
+        lines.append(f"- {op['description']}")
+    if op["tags"]:
+        lines.append(f"- tags: {', '.join(op['tags'])}")
+    for prm in op["params"]:
+        name = prm["name"] + ("[]" if prm["in"] == "query" and prm["type"].startswith("array") else "")
+        enum = f"; one of {', '.join(map(str, prm['enum']))}" if prm["enum"] else ""
+        lines.append(
+            f"- {prm['in']} `{name}` ({prm['type'] or 'value'}{', required' if prm['required'] else ''}{enum})"
+            + (f": {prm['description']}" if prm["description"] else "")
+        )
+    lines.append("Call it with api_get(path=<the path with its {placeholders} filled in>, params={...}).")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def find_api(query: str, top: int = 10) -> str:
+    """Find a Dashboard API read (GET) operation to call with api_get.
+
+    For anything the other tools do not cover. Searches the operation IDs,
+    paths, summaries and tags of this organization's own OpenAPI spec (read
+    once and cached) with English keywords, e.g. "switch dhcp server policy"
+    or "wireless packet loss by device". Pass an exact operation ID (e.g.
+    getNetworkWirelessSsids) or a concrete path to see its parameters.
+
+    Args:
+        query: English keywords, an operation ID, or an API path.
+        top: How many operations to list (1-50, default 10).
+    """
+    top = _bound(top, 1, 50)
+    query = (query or "").strip()
+    if not query:
+        raise ToolError("query is empty; give English keywords such as 'switch port statuses'")
+    ops = _api_index()
+    exact = [op for op in ops if op["id"].lower() == query.lower() or op["path"] == query]
+    if not exact and query.startswith("/"):
+        hit = _match_operation(query.split("?", 1)[0])
+        exact = [hit] if hit else []
+    if exact:
+        return _describe_operation(exact[0])
+    wanted = _words(query)
+    scored = []
+    for op in ops:
+        literal = _words(re.sub(r"\{[^}]*\}", " ", op["path"]))
+        score = sum(
+            3 * (w in _words(op["id"])) + 2 * (w in literal) + (w in _words(op["summary"])) + (w in {t.lower() for t in op["tags"]})
+            for w in wanted
+        )
+        if score:
+            scored.append((score, len(op["path"]), op))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    lines = [f"# API operations matching {query!r} ({min(top, len(scored))} of {len(scored)} of {len(ops)} GET operations)"]
+    for _, _, op in scored[:top]:
+        query_params = [p["name"] for p in op["params"] if p["in"] == "query"]
+        lines.append(f"- {op['id']} — GET {op['path']} — {op['summary']}" + (f" (query: {', '.join(query_params)})" if query_params else ""))
+    if len(scored) > top:
+        lines.append(f"- capped: {len(scored) - top} more operations matched (add keywords or raise top=)")
+    if not scored:
+        lines.append("- No operation matched; try other English keywords (e.g. 'clients', 'firmware', 'switch ports').")
+    else:
+        lines.append("Pass an operation ID to find_api to see its parameters.")
+    return "\n".join(lines)
+
+
+def _redact(node: Any, counter: list[int]) -> Any:
+    """Replace the values of secret-looking keys, also inside JSON carried in strings."""
+    if isinstance(node, dict):
+        out = {}
+        for k, v in node.items():
+            if _SECRET_KEY.search(str(k).lower()) and v not in (None, "") and not isinstance(v, bool):
+                counter[0] += 1
+                out[k] = REDACTED
+            else:
+                out[k] = _redact(v, counter)
+        return out
+    if isinstance(node, list):
+        return [_redact(v, counter) for v in node]
+    if isinstance(node, str) and node.lstrip()[:1] in ("{", "["):
+        try:
+            inner = json.loads(node)
+        except ValueError:
+            return node
+        return json.dumps(_redact(inner, counter), ensure_ascii=False)
+    return node
+
+
+def _api_segments(path: str) -> list[str]:
+    """Validate an API path and split it; only relative Dashboard paths are accepted."""
+    usage = "path must be a Dashboard API path such as /networks/N_123/wireless/ssids: no host, no query string"
+    if not isinstance(path, str) or not path.startswith("/") or path.startswith("//") or len(path) > 512:
+        raise ToolError(usage)
+    if "{" in path or "}" in path:
+        raise ToolError("fill in the {placeholders} of the path (e.g. {networkId} with a network ID from health_check)")
+    segments = path[1:].removesuffix("/").split("/")
+    if segments[0] not in API_ROOTS:
+        raise ToolError(f"{usage}; it must start with /{', /'.join(API_ROOTS)}")
+    for seg in segments:
+        if seg in ("", ".", "..") or not _SEGMENT_RE.match(seg):
+            raise ToolError(f"{usage}; segment {seg!r} is not allowed")
+    return segments
+
+
+def _scoped_serials() -> set[str]:
+    nets = {n["id"] for n in _networks()}
+    serials = set()
+    for org in _organizations():
+        devices, _ = _devices(org["id"])
+        serials.update(d["serial"] for d in devices if d.get("serial") and d.get("networkId") in nets)
+    return serials
+
+
+def _api_scope(segments: list[str], path: str, params: dict[str, Any]) -> None:
+    """Refuse paths outside MERAKI_ORG_ID / MERAKI_NETWORK_IDS; narrow organization-wide reads."""
+    root = segments[0]
+    if root == "organizations" and len(segments) > 1:
+        if segments[1] not in {str(o["id"]) for o in _organizations()}:
+            raise ToolError(f"organization {segments[1]} is not in scope (MERAKI_ORG_ID)")
+        scope = _env_list("MERAKI_NETWORK_IDS")
+        if scope and len(segments) > 2 and segments[2:] != ["networks"]:
+            op = _match_operation(path)
+            if op is None or not any(p["name"] == "networkIds" and p["in"] == "query" for p in op["params"]):
+                raise ToolError("MERAKI_NETWORK_IDS limits the scope, and this organization-wide read cannot be narrowed to those networks")
+            asked = params.get("networkIds[]")
+            asked = [asked] if isinstance(asked, str) else list(asked or [])
+            outside = [n for n in asked if n not in scope]
+            if outside:
+                raise ToolError(f"network {outside[0]} is not in scope (MERAKI_NETWORK_IDS)")
+            params["networkIds[]"] = asked or scope
+    elif root == "networks" and len(segments) > 1:
+        if segments[1] not in {n["id"] for n in _networks()}:
+            raise ToolError(f"network {segments[1]} is not in scope (see health_check for the networks)")
+    elif root == "devices" and len(segments) > 1:
+        if segments[1] not in _scoped_serials():
+            raise ToolError(f"device {segments[1]} is not in a network in scope")
+
+
+def _api_params(params: Optional[dict]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in (params or {}).items():
+        if not isinstance(key, str) or not _PARAM_KEY_RE.match(key):
+            raise ToolError(f"query parameter {key!r} is not allowed")
+        values = value if isinstance(value, list) else [value]
+        if not all(isinstance(v, (str, int, float, bool)) for v in values) or len(values) > 100:
+            raise ToolError(f"query parameter {key!r} must be a value or a list of at most 100 values")
+        if isinstance(value, list) and not key.endswith("[]"):
+            key += "[]"
+        out[key] = [str(v).lower() if isinstance(v, bool) else v for v in values] if isinstance(value, list) else (str(value).lower() if isinstance(value, bool) else value)
+    return out
+
+
+def _project(node: Any, fields: list[str]) -> Any:
+    """Keep only ``fields`` (top-level keys, or dotted paths) of a dict or of each dict in a list."""
+    if isinstance(node, list):
+        return [_project(v, fields) for v in node]
+    if not isinstance(node, dict):
+        return node
+    nested: dict[str, list[str]] = {}
+    for f in fields:
+        head, _, rest = str(f).partition(".")
+        nested.setdefault(head, [])
+        if rest:
+            nested[head].append(rest)
+    out: dict[str, Any] = {}
+    for head, rests in nested.items():
+        if head in node:
+            whole = not rests or len(rests) < sum(1 for f in fields if str(f).partition(".")[0] == head)
+            out[head] = node[head] if whole else _project(node[head], rests)
+    return out
+
+
+def _shrink(node: Any, list_max: int, str_max: int, state: dict) -> Any:
+    if isinstance(node, dict):
+        return {k: _shrink(v, list_max, str_max, state) for k, v in node.items()}
+    if isinstance(node, list):
+        kept = [_shrink(v, list_max, str_max, state) for v in node[:list_max]]
+        if len(node) > list_max:
+            state["cut"] = True
+            kept.append(f"… {len(node) - list_max} more items")
+        return kept
+    if isinstance(node, str) and len(node) > str_max:
+        state["cut"] = True
+        return node[:str_max] + f"… ({len(node)} chars)"
+    return node
+
+
+def _size(node: Any) -> int:
+    return len(json.dumps(node, ensure_ascii=False, default=str))
+
+
+@mcp.tool()
+def api_get(
+    path: str,
+    params: Optional[dict[str, Any]] = None,
+    fields: Optional[list[str]] = None,
+    offset: int = 0,
+    limit: int = 20,
+    max_chars: int = API_MAX_CHARS,
+) -> dict:
+    """Read any Dashboard API GET operation, bounded and with secrets masked.
+
+    For what the other tools do not cover; find the operation with find_api
+    first. Reads one page only. A list answer (or the one list inside an
+    object, named by ``list_key``, e.g. "events") is cut to ``limit`` items from
+    ``offset`` (``total_items`` says how many came back), ``fields`` keeps only
+    the named keys of each item (dotted paths reach inside, e.g.
+    "device.name"), and the whole answer is shrunk to ``max_chars``: long
+    nested lists and strings are cut and ``capped`` is set. Values of
+    secret-looking keys (PSKs, RADIUS secrets, SNMP communities, passwords,
+    tokens, keys) are replaced with "[redacted]". ``next_params`` /
+    ``prev_params`` are the paging parameters to add for the next page.
+
+    Args:
+        path: API path with its IDs filled in, e.g. /networks/N_123/wireless/ssids
+            (IDs and serials from health_check or other tools; must be in scope).
+        params: Query parameters, e.g. {"timespan": 3600, "perPage": 100}; a list value is sent as key[].
+        fields: Keys to keep in each item, e.g. ["name", "serial", "status"].
+        offset: First list item to return (default 0).
+        limit: List items to return, 1-200 (default 20).
+        max_chars: Size limit of the answer, 2000-60000 characters (default 20000).
+    """
+    segments = _api_segments(path)
+    query = _api_params(params)
+    path = "/" + "/".join(segments)
+    _api_scope(segments, path, query)
+    limit = _bound(limit, 1, 200)
+    offset = max(0, int(offset or 0))
+    max_chars = _bound(max_chars, 2000, 60000)
+
+    if segments == ["organizations"]:
+        data: Any = _organizations()
+        page_links: dict = {}
+    else:
+        page = _get_client().page(path, query or None)
+        data, page_links = page.data, page.links
+        if segments[0] == "organizations" and segments[2:] == ["networks"] and _env_list("MERAKI_NETWORK_IDS"):
+            scope = set(_env_list("MERAKI_NETWORK_IDS"))
+            data = [n for n in data or [] if isinstance(n, dict) and n.get("id") in scope]
+    redacted = [0]
+    data = _redact(data, redacted)
+
+    result: dict[str, Any] = {"path": path}
+    if query:
+        result["params"] = query
+    container, list_key, items = None, None, data
+    if isinstance(data, dict):
+        lists = [k for k, v in data.items() if isinstance(v, list)]
+        list_key = "items" if "items" in lists else (lists[0] if len(lists) == 1 else None)
+        if list_key:
+            container, items = data, data[list_key]
+    if isinstance(items, list):
+        result["total_items"] = len(items)
+        if list_key:
+            result["list_key"] = list_key
+        window = items[offset : offset + limit]
+        if fields:
+            window = _project(window, fields)
+        result["offset"] = offset
+        result["returned"] = len(window)
+        capped = offset + len(window) < len(items)
+        shaped: Any = {**{k: v for k, v in container.items() if k != list_key}, list_key: window} if container else window
+    else:
+        capped = False
+        shaped = _project(data, fields) if fields else data
+    if redacted[0]:
+        result["redacted"] = redacted[0]
+    for rel in ("next", "prev"):
+        if page_links.get(rel):
+            result[f"{rel}_params"] = page_links[rel]
+
+    budget = max_chars - _size(result) - 200
+    state: dict[str, Any] = {}
+    for list_max, str_max in ((50, 2000), (20, 500), (10, 200), (5, 100), (2, 60), (1, 40)):
+        if _size(shaped) <= budget:
+            break
+        state = {}
+        shaped = _shrink(shaped, list_max, str_max, state)
+    if state.get("cut"):
+        capped = True
+    if _size(shaped) > budget and isinstance(shaped, list):
+        while len(shaped) > 1 and _size(shaped) > budget:
+            shaped = shaped[: max(1, len(shaped) // 2)]
+        result["returned"] = len(shaped)
+        capped = True
+    if _size(shaped) > budget:
+        keys = sorted({k for v in (shaped if isinstance(shaped, list) else [shaped]) if isinstance(v, dict) for k in v})
+        shaped = {"keys": keys}
+        capped = True
+        result["note"] = "the answer is too large even when shrunk; only its keys are shown: pass fields= to pick some"
+    result["capped"] = capped
+    if capped and "note" not in result:
+        result["note"] = "part of the answer was left out: use fields=, offset=/limit= or narrower params"
+    result["data"] = shaped
+    return result
 
 
 # --------------------------------------------------------------------------

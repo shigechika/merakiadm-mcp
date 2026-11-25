@@ -12,9 +12,11 @@ agent's next request fail. Every tool here reads those endpoints
 server-side and returns counts, rankings and the few rows that matter, and
 says `capped` when it left something out and how to ask for less.
 
-It complements, rather than replaces, a general-purpose Meraki MCP server
-that can call any API operation: use this one for the routine checks, the
-other for open-ended exploration.
+For everything else, `find_api` searches the Dashboard's own OpenAPI spec
+for a read operation and `api_get` calls it under the same rules: one page,
+a size limit, secrets masked, the configured scope enforced. One server
+covers both the routine checks and open-ended exploration, so an agent does
+not need a second, unbounded Meraki server.
 
 ## Tools
 
@@ -29,6 +31,8 @@ All tools are read-only (GET only) and annotated `readOnlyHint`.
 | `air_marshal` | Neighbouring SSIDs: totals, SSIDs seen on your wired LAN (rogues), SSIDs using one of your SSID names |
 | `security_events` | Rogue/duplicate DHCP servers, AP spoofing, rogue AP association, IP/IPv6 conflicts, RA guard, loops, STP guards |
 | `list_events` | One page of the event log with an `older_cursor` to continue and a `complete` flag |
+| `find_api` | Search the Dashboard's read (GET) operations by English keywords, or show one operation's parameters |
+| `api_get` | Call any read operation: one page, `fields` / `offset` / `limit`, a size limit, secrets masked as `[redacted]`, scope enforced |
 
 IP conflicts on `192.0.0.0/29` are counted apart and never raise a warning:
 464XLAT (CLAT) clients all use `192.0.0.2` by design (RFC 7335).

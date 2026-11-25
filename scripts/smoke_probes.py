@@ -64,6 +64,18 @@ PROBES: dict[str, Probe] = {
         must_not_match=NO_ERROR,
         timeout=120,
     ),
+    "find_api": Probe(
+        args={"query": "wireless ssids", "top": 3},
+        must_match=(r"^# API operations matching ",),
+        must_not_match=NO_ERROR,
+        timeout=120,
+    ),
+    "api_get": Probe(
+        args={"path": "/organizations", "fields": ["id", "name"], "limit": 3, "max_chars": 4000},
+        require_keys=("path", "total_items", "capped", "data"),
+        must_not_match=NO_ERROR,
+        timeout=60,
+    ),
     "air_marshal": Probe(
         args_factory=_single_network,
         args={"hours": 1, "top": 3},

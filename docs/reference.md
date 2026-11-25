@@ -139,3 +139,45 @@ WARNING; radar, channel changes and dropped entries are informational.
 
 Ends with `older_cursor` and `complete`. The API offers an older page even
 past the oldest event, a month at a time, so an empty page counts as the end.
+
+## find_api
+
+| Argument | Default | Range |
+|---|---|---|
+| `query` | required | English keywords, an operation ID, or a concrete path |
+| `top` | 10 | 1-50 operations |
+
+Searches the GET operations of the organization's own OpenAPI spec
+(`/organizations/{id}/openapiSpec`, read once and cached for six hours; the
+first call takes a few seconds). Given an operation ID or a path, shows that
+operation's summary, description and parameters.
+
+## api_get
+
+| Argument | Default | Range |
+|---|---|---|
+| `path` | required | API path with IDs filled in, e.g. `/networks/N_123/wireless/ssids` |
+| `params` | none | query parameters; a list value is sent as `key[]` |
+| `fields` | all | keys to keep per item; dotted paths reach inside (`device.name`) |
+| `offset` | 0 | first list item |
+| `limit` | 20 | 1-200 list items |
+| `max_chars` | 20000 | 2000-60000 characters |
+
+Returns a dict: `path`, `params`, `total_items` / `offset` / `returned` (and
+`list_key` when the list sits inside an object, such as `events`),
+`redacted` (how many values were masked), `next_params` / `prev_params`,
+`capped`, `note` and `data`.
+
+- Only relative paths under `/organizations`, `/networks`, `/devices` and
+  `/administered` are accepted; a host, `..`, `%`, `?`, `#` or an unfilled
+  `{placeholder}` is refused, so the API key never leaves the API host.
+- Organizations, networks and device serials outside `MERAKI_ORG_ID` /
+  `MERAKI_NETWORK_IDS` are refused. With `MERAKI_NETWORK_IDS` set, an
+  organization-wide read is only allowed when the operation takes
+  `networkIds`, which is then limited to the configured networks.
+- One page is read. Values of secret-looking keys (PSK, RADIUS secrets, SNMP
+  communities, passwords, tokens, keys, also inside JSON carried in strings)
+  are replaced with `[redacted]` before anything else.
+- The answer is cut to `limit` items and shrunk to `max_chars`: long nested
+  lists and strings are shortened, then items are dropped; if even that is
+  too large, only the keys are returned. Any of these sets `capped`.

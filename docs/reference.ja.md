@@ -133,3 +133,42 @@ WARNING にし、レーダー、チャネル変更、取りこぼしは参考と
 
 最後に `older_cursor` と `complete` を出します。API は最古のイベントより前にも
 1 か月ずつ古いページを返し続けるので、空のページで終わりとみなします。
+
+## find_api
+
+| 引数 | 既定 | 範囲 |
+|---|---|---|
+| `query` | 必須 | 英語のキーワード、operation ID、または具体的なパス |
+| `top` | 10 | API の数（1〜50） |
+
+組織自身の OpenAPI 仕様（`/organizations/{id}/openapiSpec`、1 回読んで 6 時間
+覚えておく。最初の呼び出しは数秒かかる）の GET の API を探します。operation ID
+かパスを渡すと、その API の説明と引数を示します。
+
+## api_get
+
+| 引数 | 既定 | 範囲 |
+|---|---|---|
+| `path` | 必須 | ID を埋めた API のパス（例 `/networks/N_123/wireless/ssids`） |
+| `params` | なし | クエリの引数。一覧の値は `key[]` で送る |
+| `fields` | すべて | 各要素に残すキー。点でつなぐと中に入る（`device.name`） |
+| `offset` | 0 | 一覧の何件目から |
+| `limit` | 20 | 一覧の件数（1〜200） |
+| `max_chars` | 20000 | 文字数の上限（2000〜60000） |
+
+dict を返します：`path`、`params`、`total_items` / `offset` / `returned`（一覧が
+オブジェクトの中にあるとき、たとえば `events` は `list_key` も）、`redacted`
+（伏せた値の数）、`next_params` / `prev_params`、`capped`、`note`、`data`。
+
+- 受け付けるのは `/organizations`・`/networks`・`/devices`・`/administered`
+  の下の相対パスだけです。ホスト、`..`、`%`、`?`、`#`、埋めていない
+  `{placeholder}` は断るので、API キーが API のホストの外へ出ることはありません。
+- `MERAKI_ORG_ID` / `MERAKI_NETWORK_IDS` の外の組織・ネットワーク・機器の
+  シリアルは断ります。`MERAKI_NETWORK_IDS` があるとき、組織全体を読む API は
+  `networkIds` を取るものだけ許し、設定したネットワークに絞ります。
+- 読むのは 1 ページだけです。秘密らしいキー（PSK、RADIUS の共有鍵、SNMP の
+  コミュニティ名、パスワード、トークン、鍵。文字列に入った JSON の中も）の値は、
+  ほかの処理より先に `[redacted]` に置き換えます。
+- 答えは `limit` 件に切り、`max_chars` に収まるよう縮めます：長い入れ子の一覧と
+  文字列を短くし、それでも足りなければ要素を減らし、なお大きければキーだけを
+  返します。どれかが起きると `capped` になります。

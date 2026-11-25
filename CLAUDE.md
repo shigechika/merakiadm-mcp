@@ -25,9 +25,10 @@ MERAKI_DASHBOARD_API_KEY=... .venv/bin/python scripts/smoke_test.py   # live smo
   `meraki.com` hosts (httpx drops the
   Authorization header on cross-host redirects). 429 and 5xx are retried with
   `Retry-After` within a retry budget. httpx/httpcore logging is held at WARNING.
-- `merakiadm_mcp/server.py` — `MCPServer` with 9 tools: `health_check`,
+- `merakiadm_mcp/server.py` — `MCPServer` with 11 tools: `health_check`,
   `daily_brief`, `connection_failures`, `wireless_quality`, `availability_history`, `air_marshal`,
-  `security_events`, `operational_events`, `list_events`. Event type sets
+  `security_events`, `operational_events`, `list_events`, and the generic pair
+  `find_api` (searches the org's own OpenAPI spec, cached 6 h) / `api_get`. Event type sets
   live in `SECURITY_EVENT_TYPES` and `OPERATIONAL_EVENT_GROUPS` (the latter
   holds only rare types; `OPERATIONAL_WARN_TYPES` decides what raises a
   WARNING in `daily_brief`). `_Server.tool` marks every tool read-only and turns
@@ -44,7 +45,13 @@ MERAKI_DASHBOARD_API_KEY=... .venv/bin/python scripts/smoke_test.py   # live smo
   hundreds of KB, a day of failed connections thousands of rows, a day of
   wireless events tens of thousands). A tool aggregates server-side, takes `hours` and `top` /
   `per_page` bounds clamped by `_bound`, and says `capped` when it dropped
-  anything. Never add a tool that returns a raw list.
+  anything. Never add a tool that returns a raw list. `api_get` is no
+  exception: one page, `limit` items, `max_chars`, `capped`.
+- `api_get` safety: only relative paths under `API_ROOTS` pass
+  `_api_segments` (the client treats a path starting with `http` as a URL, so
+  this check is what keeps the key on the API host); `_api_scope` enforces
+  `MERAKI_ORG_ID` / `MERAKI_NETWORK_IDS`; `_redact` runs on the parsed answer
+  before any shaping. Keep the hostile-path tests passing.
 - Events are read newest page first (no `startingAfter`, which answers
   oldest first) and trimmed to the window, so a capped read loses the oldest
   events of the window, never the newest. The events endpoint refuses
