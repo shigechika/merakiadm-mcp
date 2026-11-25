@@ -1009,3 +1009,84 @@ def test_change_log_paging_stops_when_a_page_only_repeats():
 def test_co_term_expiration_dates_are_read():
     assert server._parse_ts("Feb 8, 2020 UTC") == server.datetime.datetime(2020, 2, 8, tzinfo=server.datetime.timezone.utc)
     assert server._parse_ts("nonsense") is None
+
+
+def test_only_active_subscriptions_decide_the_license_line(monkeypatch):
+    soon_ok = _recent(-60 * 24 * 300)
+    rows = [{"name": "OLD", "status": "expired", "endDate": _recent(60 * 24 * 30)}, {"name": "NEW", "status": "active", "endDate": soon_ok}]
+    monkeypatch.setattr(server, "_get_client", lambda: type("C", (), {"get_all": lambda self, *a, **k: (rows, False)})())
+    line, warn = server._license_line({"id": "100", "licensing": {"model": "subscription"}})
+    assert warn is False and "NEW active" in line and "OLD" not in line
+    rows[:] = rows[:1]
+    line, warn = server._license_line({"id": "100", "licensing": {"model": "subscription"}})
+    assert warn is True and "no active subscription (1 listed)" in line
+    assert "per-device licensing: not summarized" in server._license_line({"id": "1", "licensing": {"model": "per-device"}})[0]
+
+
+@respx.mock
+def test_network_scope_hides_organization_wide_changes_and_the_license(monkeypatch):
+    monkeypatch.setenv("MERAKI_NETWORK_IDS", "N_1")
+    daily_routes({"assoc": 0, "auth": 0, "dhcp": 0, "dns": 0, "success": 10})
+    text = server.daily_brief(hours=24, top=3)
+    assert "[CHANGES] 1 (0 organization-wide) by alice 1" in text and "[LICENSE" not in text
+    assert "Administrators" not in server.config_changes(hours=48)
+
+
+@respx.mock
+def test_a_timeout_on_a_brief_line_is_reported_not_critical():
+    daily_routes({"assoc": 0, "auth": 0, "dhcp": 0, "dns": 0, "success": 10})
+    respx.get(f"{BASE}/networks/N_1/firmwareUpgrades").mock(side_effect=httpx.ReadTimeout("slow"))
+    text = server.daily_brief(hours=24, top=3)
+    assert "[FIRMWARE] not read: slow" in text and "0 CRITICAL" in text and "[UPLINK]" in text
+
+
+@respx.mock
+def test_change_log_follow_up_pages_drop_timespan_and_old_entries_are_trimmed():
+    base_routes()
+    asked = []
+    link = {"Link": f'<{BASE}/organizations/100/configurationChanges?t1=2026-01-01T00:00:00Z>; rel=next'}
+
+    def answer(r):
+        asked.append(dict(r.url.params))
+        if "t1" in r.url.params:
+            return httpx.Response(200, json=[{"ts": "2020-01-01T00:00:00Z", "page": "Old"}])
+        return httpx.Response(200, json=[{"ts": _recent(5), "page": "New"}], headers=link)
+
+    respx.get(f"{BASE}/organizations/100/configurationChanges").mock(side_effect=answer)
+    rows, _ = server._org_changes("100", 24)
+    assert "timespan" not in asked[1] and [r["page"] for r in rows] == ["New"]
+
+
+@respx.mock
+def test_find_client_reports_a_capped_ip_search_and_an_unknown_mac(monkeypatch):
+    base_routes()
+    monkeypatch.setattr(server, "CLIENT_SCAN_PAGES", 1)
+    link = {"Link": f'<{BASE}/networks/N_1/clients?startingAfter=p2>; rel=next'}
+    respx.get(f"{BASE}/networks/N_1/clients").mock(return_value=httpx.Response(200, json=[{"id": "k2", "mac": "m2", "ip": "10.0.0.9"}], headers=link))
+    respx.get(f"{BASE}/networks/N_1/clients/k2").mock(return_value=httpx.Response(200, json={"id": "k2", "mac": "m2", "ip": "10.0.0.9"}))
+    assert "capped: more clients were seen than were scanned" in server.find_client("10.0.0.9")
+    respx.get(f"{BASE}/organizations/100/clients/search").mock(return_value=httpx.Response(404, json={"errors": ["Not found"]}))
+    assert "No client matched" in server.find_client("aa:bb:cc:dd:ee:ff")
+
+
+@respx.mock
+def test_api_get_names_the_most_literal_operation():
+    base_routes()
+    spec = {"paths": {
+        "/networks/{networkId}/clients/{clientId}": {"get": {"operationId": "getNetworkClient"}},
+        "/networks/{networkId}/clients/overview": {"get": {"operationId": "getNetworkClientsOverview"}},
+    }}
+    respx.get(f"{BASE}/organizations/100/openapiSpec").mock(return_value=httpx.Response(200, json=spec))
+    server.find_api("clients")
+    respx.get(f"{BASE}/networks/N_1/clients/overview").mock(return_value=httpx.Response(200, json={}))
+    assert server.api_get("/networks/N_1/clients/overview")["operation"] == "getNetworkClientsOverview"
+
+
+@respx.mock
+def test_health_check_says_when_organizations_are_left_out():
+    orgs = [{"id": str(i), "name": f"o{i}"} for i in range(25)]
+    respx.get(f"{BASE}/organizations").mock(return_value=httpx.Response(200, json=orgs))
+    respx.route(url__regex=rf"{BASE}/organizations/\d+/networks").mock(return_value=httpx.Response(200, json=[]))
+    respx.route(url__regex=rf"{BASE}/organizations/\d+/devices/statuses/overview").mock(return_value=httpx.Response(200, json={}))
+    result = server.health_check()
+    assert len(result["organization_list"]) == 20 and result["organization_list_capped"] == "5 more organizations not listed"

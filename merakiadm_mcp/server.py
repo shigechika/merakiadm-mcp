@@ -538,6 +538,8 @@ def health_check() -> dict:
         nets = _networks()
         result["networks"] = len(nets)
         result["organization_list"] = [{"id": str(o.get("id")), "name": o.get("name")} for o in orgs[:20]]
+        if len(orgs) > 20:
+            result["organization_list_capped"] = f"{len(orgs) - 20} more organizations not listed"
         result["network_list"] = [
             {"id": n.get("id"), "name": n.get("name"), "products": n.get("productTypes") or []} for n in nets[:50]
         ]
@@ -1279,7 +1281,12 @@ def _client_matches(net: dict, query: str, hours: int) -> tuple[list[dict], str,
     q = query.strip()
     if _MAC_RE.match(q):
         mac = _norm_mac(q)
-        found = _get_client().get(f"/organizations/{net['organizationId']}/clients/search", {"mac": mac}) or {}
+        try:
+            found = _get_client().get(f"/organizations/{net['organizationId']}/clients/search", {"mac": mac}) or {}
+        except MerakiAPIError as exc:
+            if exc.status == 404:
+                return [], "MAC", False
+            raise
         cid = found.get("clientId")
         rows = [r for r in found.get("records") or [] if (r.get("network") or {}).get("id") == net["id"]]
         return ([{**r, "id": cid, "mac": found.get("mac") or mac, "manufacturer": found.get("manufacturer")} for r in rows][:1], "MAC", False)
@@ -1296,7 +1303,7 @@ def _client_matches(net: dict, query: str, hours: int) -> tuple[list[dict], str,
                     exact.append(r)
             except ValueError:
                 continue
-        return exact, f"IP over the last {hours}h", capped and not exact
+        return exact, f"IP over the last {hours}h", capped
     needle = q.lower()
     rows, capped = _get_client().get_all(
         f"/networks/{net['id']}/clients", {"timespan": hours * 3600, "perPage": 1000}, CLIENT_SCAN_PAGES
@@ -1432,8 +1439,12 @@ def _org_changes(org_id: str, hours: int) -> tuple[list[dict], bool]:
             nxt = page.links.get("next")
             if not fresh or not nxt:
                 break
-            query = {"timespan": hours * 3600, "perPage": 1000, **nxt}
+            query = {"perPage": 1000, **nxt}
+            if "t0" not in nxt and "t1" not in nxt:
+                query["timespan"] = hours * 3600
             capped = index == 9
+        start = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
+        rows = [r for r in rows if (_parse_ts(r.get("ts")) or start) >= start]
         rows = _redact(rows, [0])
         rows.sort(key=lambda r: str(r.get("ts") or ""), reverse=True)
         return rows, capped
@@ -1442,8 +1453,9 @@ def _org_changes(org_id: str, hours: int) -> tuple[list[dict], bool]:
 
 
 def _changes_for(net: dict, rows: list[dict]) -> list[dict]:
-    """Entries of this network, plus organization-wide ones (no network)."""
-    return [r for r in rows if r.get("networkId") in (None, "", net["id"])]
+    """Entries of this network, plus organization-wide ones (no network) unless MERAKI_NETWORK_IDS limits the scope."""
+    keep = (net["id"],) if _env_list("MERAKI_NETWORK_IDS") else (None, "", net["id"])
+    return [r for r in rows if r.get("networkId") in keep]
 
 
 def _short(value: Any, limit: int = 100) -> str:
@@ -1496,7 +1508,7 @@ def config_changes(network: Optional[str] = None, hours: int = 168, top: int = 3
 def _changes_line(net: dict, hours: int, top: int) -> str:
     try:
         rows, capped = _org_changes(net["organizationId"], hours)
-    except MerakiAPIError as exc:
+    except (MerakiAPIError, httpx.HTTPError) as exc:
         return f"- [CHANGES] not read: {exc}"
     rows = _changes_for(net, rows)
     if not rows:
@@ -1514,7 +1526,7 @@ def _changes_line(net: dict, hours: int, top: int) -> str:
 def _firmware_line(net: dict, tz: datetime.tzinfo) -> str:
     try:
         products = (_get_client().get(f"/networks/{net['id']}/firmwareUpgrades") or {}).get("products") or {}
-    except MerakiAPIError as exc:
+    except (MerakiAPIError, httpx.HTTPError) as exc:
         return f"- [FIRMWARE] not read: {exc}"
     parts = []
     for product, info in sorted(products.items()):
@@ -1527,38 +1539,48 @@ def _firmware_line(net: dict, tz: datetime.tzinfo) -> str:
 
 
 def _license_line(org: dict, warn_days: int = 30) -> tuple[str, bool]:
-    """(the [LICENSE] line, whether it warrants a WARNING)."""
+    """(the [LICENSE] line, whether it warrants a WARNING).
+
+    Subscription model: only active subscriptions count (expired, canceled or
+    not yet started ones are listed by the API too); no active subscription,
+    or one ending within ``warn_days``, warns. Co-term model: the overview's
+    status and expiration date. Per-device model: not summarized.
+    """
     now = datetime.datetime.now(datetime.timezone.utc)
+    model = (org.get("licensing") or {}).get("model")
     try:
-        if ((org.get("licensing") or {}).get("model")) == "subscription":
-            subs = _get_client().get(
-                "/administered/licensing/subscription/subscriptions", {"organizationIds[]": [str(org["id"])]}
-            ) or []
-            if not subs:
-                return "- [LICENSE] no subscription found", False
+        if model == "subscription":
+            subs, capped = _get_client().get_all(
+                "/administered/licensing/subscription/subscriptions", {"organizationIds[]": [str(org["id"])]}, 5
+            )
+            active = [x for x in subs if x.get("status") == "active"]
+            note = " (capped: more subscriptions not read)" if capped else ""
+            if not active:
+                return f"- [LICENSE-EXPIRING] no active subscription ({len(subs)} listed){note}", True
             parts, warn = [], False
-            for sub in subs:
+            for sub in active:
                 end = _parse_ts(sub.get("endDate"))
                 days = (end - now).days if end else None
                 seats = ((sub.get("counts") or {}).get("seats")) or {}
-                bad = sub.get("status") != "active" or (days is not None and days <= warn_days)
-                warn = warn or bad
+                warn = warn or (days is not None and days <= warn_days)
                 parts.append(
-                    f"{sub.get('name') or sub.get('subscriptionId')} {sub.get('status')}"
+                    f"{sub.get('name') or sub.get('subscriptionId')} active"
                     + (f" until {end:%Y-%m-%d} ({days} days)" if end else "")
                     + (f", seats {seats.get('assigned')}/{seats.get('limit')}" if seats else "")
                 )
-            return f"- [LICENSE{'-EXPIRING' if warn else ''}] " + "; ".join(parts), warn
+            return f"- [LICENSE{'-EXPIRING' if warn else ''}] " + "; ".join(parts) + note, warn
+        if model == "per-device":
+            return "- [LICENSE] per-device licensing: not summarized (see api_get)", False
         overview = _get_client().get(f"/organizations/{org['id']}/licenses/overview") or {}
         end = _parse_ts(overview.get("expirationDate"))
         days = (end - now).days if end else None
         warn = overview.get("status") not in (None, "OK") or (days is not None and days <= warn_days)
         return (
-            f"- [LICENSE{'-EXPIRING' if warn else ''}] {overview.get('status')}"
+            f"- [LICENSE{'-EXPIRING' if warn else ''}] {overview.get('status') or 'status unknown'}"
             + (f" until {end:%Y-%m-%d} ({days} days)" if end else ""),
             warn,
         )
-    except MerakiAPIError as exc:
+    except (MerakiAPIError, httpx.HTTPError) as exc:
         return f"- [LICENSE] not read: {exc}", False
 
 
@@ -2021,7 +2043,7 @@ def api_get(
     """Read any Dashboard API GET operation, bounded and with secrets masked.
 
     For what the other tools do not cover; find the operation with find_api
-    first. Reads one page only. A list answer (or the one list inside an
+    first. Reads one page, or up to ``max_pages``. A list answer (or the one list inside an
     object, named by ``list_key``, e.g. "events") is cut to ``limit`` items from
     ``offset`` (``total_items`` says how many came back), ``fields`` keeps only
     the named keys of each item (dotted paths reach inside, e.g.
@@ -2091,7 +2113,8 @@ def api_get(
 
     result: dict[str, Any] = {"path": path, "observed_at": observed_at}
     index = _api_index(cached_only=True) if segments != ["organizations"] else None
-    op = next((o for o in index or [] if o["regex"].match(path)), None) if index else None
+    hits = [o for o in index or [] if o["regex"].match(path)]
+    op = max(hits, key=lambda o: o["path"].count("/") - o["path"].count("{")) if hits else None
     if op:
         result["operation"] = op["id"]
     if query:
@@ -2187,7 +2210,7 @@ def _wireless_line(net: dict, hours: int, top: int) -> str:
         loss, loss_capped = _packet_loss(net, hours)
         use, use_capped = _channel_use(net, hours)
         names, _ = _device_names(net["organizationId"])
-    except MerakiAPIError as exc:
+    except (MerakiAPIError, httpx.HTTPError) as exc:
         return f"- [WIRELESS] not read: {exc}"
     parts = [f"packet loss {_loss_totals(loss)}"]
     worst = _loss_ranking(loss, "upstream", MIN_LOSS_PACKETS)[:top]
@@ -2373,7 +2396,7 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
             step()
             body.append(_firmware_line(net, _tz(net)))
             step()
-            if org_id not in licensed:
+            if org_id not in licensed and not _env_list("MERAKI_NETWORK_IDS"):
                 licensed.add(org_id)
                 org = next((o for o in _organizations() if str(o.get("id")) == str(org_id)), {"id": org_id})
                 line, warn = _license_line(org)

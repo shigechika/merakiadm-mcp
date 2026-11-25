@@ -80,7 +80,9 @@ counts by administrator and by page, then the newest entries with time,
 administrator, network or SSID, page, label and old → new value (shortened).
 When the label or page names a secret (PSK, password, community, key…), the
 old and new values are `[redacted]`; `api_get` does the same for any
-change-log entry. The endpoint keeps offering a next page that repeats the
+change-log entry. With `MERAKI_NETWORK_IDS` set, organization-wide entries are left
+out (here and in `[CHANGES]`) and `[LICENSE]` is not shown, as `api_get` refuses
+those reads under that scope. The endpoint keeps offering a next page that repeats the
 last entry, so reading stops when a page adds nothing new.
 
 ## availability_history
@@ -200,7 +202,7 @@ when the index is already cached), `params`, `pages_read`, `has_next_page`, `tot
   `MERAKI_NETWORK_IDS` are refused. With `MERAKI_NETWORK_IDS` set, an
   organization-wide read is only allowed when the operation takes
   `networkIds`, which is then limited to the configured networks.
-- One page is read. Values of secret-looking keys (PSK, RADIUS secrets, SNMP
+- One page is read by default (up to `max_pages`). Values of secret-looking keys (PSK, RADIUS secrets, SNMP
   communities, passwords, tokens, keys, also inside JSON carried in strings)
   are replaced with `[redacted]` before anything else.
 - The answer is cut to `limit` items and shrunk to `max_chars`: long nested
