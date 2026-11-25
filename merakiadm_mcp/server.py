@@ -114,6 +114,11 @@ MAX_HOURS = 168  # the failed-connection and connection-stats endpoints look bac
 CACHE_SECONDS = 300
 MAX_BRIEF_NETWORKS = 25  # each network costs about ten requests and a section of output
 BRIEF_TIME_BUDGET = 40.0  # seconds; networks not started by then are reported as capped
+BRIEF_STEP_LIMIT = 50.0  # seconds; a network still running then stops between steps
+
+
+class _BriefTimeUp(Exception):
+    """daily_brief ran past BRIEF_STEP_LIMIT inside a network."""
 _EVENT_TYPE_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 #: RFC 7335 IPv4 Service Continuity Prefix: 464XLAT (CLAT) clients all use
 #: 192.0.0.2 on purpose, so a "conflict" on it is not a real duplicate.
@@ -362,6 +367,8 @@ def _read_events(net: dict, product_type: str, types: list[str], hours: int, per
     Without a start the endpoint answers newest first, so when the page is full
     the events left unread are the oldest of the window, not the newest
     (``startingAfter`` would answer oldest first and lose the newest instead).
+    A page that is not full reaches back a month (``pageStartAt``); the read
+    is capped when an older page exists and this one starts inside the window.
     """
     page = _get_client().page(
         f"/networks/{net['id']}/events",
@@ -371,8 +378,12 @@ def _read_events(net: dict, product_type: str, types: list[str], hours: int, per
     events = data.get("events") or []
     start = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
     kept = [e for e in events if (_parse_ts(e.get("occurredAt")) or start) >= start]
-    capped = len(events) >= per_page and len(kept) == len(events) and "prev" in page.links
-    return kept, capped
+    page_start = _parse_ts(data.get("pageStartAt"))
+    if page_start is None:
+        capped = len(events) >= per_page and len(kept) == len(events)
+    else:
+        capped = page_start > start
+    return kept, capped and "prev" in page.links
 
 
 def _collect_events(net: dict, types: list[str], hours: int) -> tuple[list[dict], list[str]]:
@@ -417,9 +428,11 @@ def _dropped_summary(events: list[dict]) -> str:
         data = e.get("eventData") or {}
         kind = str(data.get("type") or "unspecified type")
         try:
-            dropped[kind] += int(data.get("n") or 1)
+            count = int(data.get("n", 1))
         except (TypeError, ValueError):
-            dropped[kind] += 1
+            count = 1
+        if count > 0:
+            dropped[kind] += count
     return _top(dropped, 8) if dropped else ""
 
 
@@ -787,9 +800,9 @@ def list_events(
     A busy wireless network logs tens of thousands of events a day, so read
     one page at a time and narrow with ``event_types`` where possible. The
     answer ends with ``older_cursor`` (pass it back as ``cursor`` for the
-    previous page) and ``complete`` (false while the API still offers an
-    older page; pages are cut by time, so an empty page does not mean the
-    log ends there).
+    previous page) and ``complete``. The endpoint offers an older page even
+    past the oldest event, a month at a time, so an empty page counts as the
+    end; pass ``older_cursor`` anyway to look further back.
 
     Args:
         product_type: wireless, switch, appliance, camera, cellularGateway or sensor.
@@ -818,7 +831,9 @@ def list_events(
     ]
     lines.extend(_event_line(e, tz, ssids) for e in sorted(events, key=lambda e: e.get("occurredAt") or "", reverse=True))
     lines.append(f"\nolder_cursor: {older or '-'}")
-    lines.append(f"complete: {'false' if older else 'true'}")
+    if older and not events:
+        lines.append("no events on this page; treated as the end of the log")
+    lines.append(f"complete: {'false' if older and events else 'true'}")
     return "\n".join(lines)
 
 
@@ -848,14 +863,14 @@ def _outages(net: dict, hours: int) -> tuple[list[dict], int, bool]:
     )
     now = datetime.datetime.now(datetime.timezone.utc)
     start = now - datetime.timedelta(hours=hours)
+    stamped = [(ts, c) for c in changes if (ts := _parse_ts(c.get("ts"))) is not None]
+    stamped.sort(key=lambda pair: pair[0])
+    # A capped history lost its oldest changes: count down time only from the oldest one read.
+    floor = max(stamped[0][0], start) if capped and stamped else start
     per: dict[str, dict] = {}
-    for change in sorted(changes, key=lambda c: c.get("ts") or ""):
+    for ts, change in stamped:
         device = change.get("device") or {}
         key = device.get("serial") or device.get("name") or "?"
-        try:
-            ts = datetime.datetime.fromisoformat(str(change.get("ts")).replace("Z", "+00:00"))
-        except ValueError:
-            continue
         old, new = _status_of(change, "old"), _status_of(change, "new")
         if key not in per:
             per[key] = {
@@ -863,8 +878,8 @@ def _outages(net: dict, hours: int) -> tuple[list[dict], int, bool]:
                 "product": device.get("productType") or "",
                 "downs": 0,
                 "seconds": 0.0,
-                # Not online before its first change in the window: down since the window began.
-                "down_since": start if old not in ("online", "?") else None,
+                # Not online before its first change read: down since the window (or the read) began.
+                "down_since": floor if old not in ("online", "?") else None,
                 "from_start": old not in ("online", "?"),
                 "last": None,
             }
@@ -872,7 +887,7 @@ def _outages(net: dict, hours: int) -> tuple[list[dict], int, bool]:
         row["last"] = change.get("ts")
         if new == "online":
             if row["down_since"] is not None:
-                row["seconds"] += (ts - max(row["down_since"], start)).total_seconds()
+                row["seconds"] += (ts - max(row["down_since"], floor)).total_seconds()
             row["down_since"] = None
         elif new != "?":
             if old == "online":
@@ -885,7 +900,7 @@ def _outages(net: dict, hours: int) -> tuple[list[dict], int, bool]:
         # state at the window start is a guess, not a fact.
         row["start_unknown"] = capped and row["from_start"]
         if row["down_since"] is not None:
-            row["seconds"] += (now - max(row["down_since"], start)).total_seconds()
+            row["seconds"] += (now - max(row["down_since"], floor)).total_seconds()
         if row["downs"] or row["seconds"] or row["from_start"]:
             rows.append({**row, "minutes": round(row["seconds"] / 60), "still_down": row["down_since"] is not None})
     rows.sort(key=lambda r: (-r["downs"], -r["minutes"]))
@@ -900,7 +915,8 @@ def _outage_text(row: dict, tz) -> str:
     notes.append(f"last change {_local(row['last'], tz)}")
     if row["still_down"]:
         notes.append("still down")
-    return f"{row['name']} {row['downs']}x {row['minutes']} min ({', '.join(notes)})"
+    minutes = f"at least {row['minutes']}" if row["start_unknown"] else str(row["minutes"])
+    return f"{row['name']} {row['downs']}x {minutes} min ({', '.join(notes)})"
 
 
 @mcp.tool()
@@ -983,7 +999,8 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
     - [UPLINK] switch ports flagged as uplinks that are not connected
 
     At most 25 networks, and only those started within 40 seconds, are
-    checked per call; the rest are counted as capped.
+    checked per call; the rest are counted as capped. A network still
+    running at 50 seconds stops between steps and says so.
 
     Output tiers:
     - CRITICAL — the API could not be read for that network
@@ -1018,6 +1035,11 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
         tier, body = "OK", []
         org_id = net["organizationId"]
         products = net.get("productTypes") or []
+
+        def step() -> None:
+            if time.monotonic() - started > BRIEF_STEP_LIMIT:
+                raise _BriefTimeUp
+
         try:
             avail, avail_capped = _get_client().get_all(
                 f"/organizations/{org_id}/devices/availabilities", {"networkIds[]": [net["id"]], "perPage": 1000}
@@ -1035,6 +1057,7 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
                 more = f" … capped: {len(down) - top} more" if len(down) > top else ""
                 body.append(f"- [DEVICES-DOWN] {listed}{more}")
 
+            step()
             outages, changes, outage_capped = _outages(net, hours)
             if outages:
                 tier = "WARNING"
@@ -1049,6 +1072,7 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
             else:
                 body.append(f"- [AVAILABILITY] every device stayed online ({changes} status changes)")
 
+            step()
             alerts = _get_client().get(f"/networks/{net['id']}/health/alerts") or []
             if alerts:
                 body.append(
@@ -1057,6 +1081,7 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
                     + (f" … capped: {len(alerts) - top} more" if len(alerts) > top else "")
                 )
 
+            step()
             if "wireless" in products:
                 stats = _connection_stats(net, hours)
                 summary, pct = _success_line(stats)
@@ -1068,6 +1093,7 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
                     per_ap = collections.Counter(names.get(r.get("serial"), r.get("serial")) for r in _failed_connections(net, hours))
                     body.append(f"- [CONNECT-TOP-AP] {_top(per_ap, top)}{' (' + NAMES_CAPPED + ')' if names_capped else ''}")
 
+            step()
             events, capped = _collect_events(net, list(SECURITY_EVENT_TYPES), hours)
             counts = collections.Counter(e.get("type") for e in _split_clat(events)[0])
             if counts:
@@ -1076,6 +1102,7 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
             else:
                 body.append(f"- [SECURITY] none{_capped_note(capped)}")
 
+            step()
             events, capped = _collect_events(net, list(OPERATIONAL_EVENT_TYPES), hours)
             ops = collections.Counter(e.get("type") for e in events if e.get("type") != "events_dropped2")
             warn = collections.Counter({t: n for t, n in ops.items() if t in OPERATIONAL_WARN_TYPES})
@@ -1089,6 +1116,7 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
             if dropped:
                 body.append(f"- [LOG-DROPPED] access points dropped high-volume events: {dropped}")
 
+            step()
             if "switch" in products:
                 switches, more = _switch_ports(org_id, [net["id"]])
                 uplinks, problems = _uplink_problems(switches)
@@ -1103,6 +1131,8 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
                     body.append(f"- [UPLINK] {len(switches)} switches, {uplinks} uplink ports, none down{' (capped)' if more else ''}")
                 else:
                     body.append(f"- [UPLINK] {len(switches)} switches, no port is flagged as an uplink (not checked){' (capped)' if more else ''}")
+        except _BriefTimeUp:
+            body.append(f"- capped: the brief reached {BRIEF_STEP_LIMIT:.0f} s; the rest of this network was not checked")
         except Exception as exc:  # noqa: BLE001
             tier = "CRITICAL"
             body.append(f"- [API-ERROR] {exc}")

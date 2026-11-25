@@ -26,8 +26,9 @@ length when `hours` is 84 or less) and `[CONNECT-TOP-AP]`, `[SECURITY]`,
 `[API-ERROR]`. Each network is CRITICAL (API error), WARNING (device down now
 or during the window, failures above the threshold, any security event, a
 warning-level operational event, an uplink down) or OK. Switch ports are only checked when the switch flags them
-as uplinks. At most 25 networks are checked per call; the rest are reported
-as `capped`.
+as uplinks. At most 25 networks, and only those started within 40 seconds, are checked
+per call; the rest are reported as `capped`. A network still running at
+50 seconds stops between steps and says so.
 
 ## connection_failures
 
@@ -110,4 +111,5 @@ WARNING; radar, channel changes and dropped entries are informational.
 | `per_page` | 50 | 3-100 |
 | `cursor` | newest page | `older_cursor` from a previous answer |
 
-Ends with `older_cursor` and `complete`.
+Ends with `older_cursor` and `complete`. The API offers an older page even
+past the oldest event, a month at a time, so an empty page counts as the end.

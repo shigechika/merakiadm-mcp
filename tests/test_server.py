@@ -462,3 +462,77 @@ def test_daily_brief_stops_starting_networks_after_the_time_budget(monkeypatch):
     text = server.daily_brief(hours=24, failure_threshold=10.0, top=3)
     assert "1 networks: 1 OK" in text
     assert "capped: 1 more networks not checked" in text
+
+
+@respx.mock
+def test_event_reads_are_capped_by_the_page_start():
+    base_routes()
+    prev = {"Link": f"<{BASE}/networks/N_1/events?endingBefore=z>; rel=prev"}
+    pages = {
+        # Not full, but the page starts an hour ago: older events of a 24 h window are unread.
+        "wireless": {"events": [{"occurredAt": _recent(5), "type": "rogue_dhcp"}], "pageStartAt": _recent(60)},
+        # Not full and reaching back a month: the whole window was read.
+        "switch": {"events": [], "pageStartAt": _recent(60 * 24 * 31)},
+    }
+    respx.get(f"{BASE}/networks/N_1/events").mock(
+        side_effect=lambda request: httpx.Response(200, json=pages[request.url.params["productType"]], headers=prev)
+    )
+    text = server.security_events(hours=24, top=2)
+    assert "capped: older wireless events in the window not read" in text
+
+
+@respx.mock
+def test_list_events_treats_an_empty_page_as_the_end():
+    base_routes()
+    link = f"<{BASE}/networks/N_1/events?productType=switch&endingBefore=2026-10-25T00%3A00%3A00Z>; rel=prev"
+    respx.get(f"{BASE}/networks/N_1/events").mock(
+        return_value=httpx.Response(200, json={"events": [], "pageStartAt": "2026-10-25T00:00:00Z", "pageEndAt": "2026-11-25T00:00:00Z"}, headers={"Link": link})
+    )
+    text = server.list_events("switch")
+    assert "treated as the end of the log" in text
+    assert "complete: true" in text
+    assert "older_cursor: endingBefore=" in text
+
+
+def test_dropped_entries_with_no_count_are_skipped():
+    events = [
+        {"type": "events_dropped2", "eventData": {"type": "association", "n": 0}},
+        {"type": "events_dropped2", "eventData": {"type": "roam"}},
+    ]
+    assert server._dropped_summary(events) == "roam 1"
+
+
+@respx.mock
+def test_capped_history_counts_down_time_from_the_oldest_change_read():
+    base_routes()
+    nxt = f"<{BASE}/organizations/100/devices/availabilities/changeHistory?startingAfter=z>; rel=next"
+    respx.get(f"{BASE}/organizations/100/devices/availabilities/changeHistory").mock(
+        return_value=httpx.Response(
+            200,
+            json=[change("Q-AP1", "ap-1", _recent(60), "online", "offline"), change("Q-AP2", "ap-2", _recent(30), "offline", "online")],
+            headers={"Link": nxt},
+        )
+    )
+    text = server.availability_history(hours=168, top=5)
+    assert "ap-2 0x at least 30 min (state at window start unknown" in text
+
+
+@respx.mock
+def test_change_times_without_an_offset_are_read_as_utc():
+    base_routes()
+    naive = _recent(30).rstrip("Z")
+    respx.get(f"{BASE}/organizations/100/devices/availabilities/changeHistory").mock(
+        return_value=httpx.Response(200, json=[change("Q-AP2", "ap-2", naive, "online", "offline")])
+    )
+    text = server.availability_history(hours=24, top=5)
+    assert "ap-2 1x 30 min" in text
+
+
+@respx.mock
+def test_daily_brief_stops_a_network_between_steps_after_the_limit(monkeypatch):
+    monkeypatch.setattr(server, "BRIEF_STEP_LIMIT", -1.0)
+    daily_routes({"success": 10})
+    text = server.daily_brief(hours=24, failure_threshold=10.0, top=3)
+    assert "[DEVICES]" in text
+    assert "the rest of this network was not checked" in text
+    assert "[SECURITY]" not in text

@@ -48,7 +48,10 @@ MERAKI_DASHBOARD_API_KEY=... .venv/bin/python scripts/smoke_test.py   # live smo
 - Events are read newest page first (no `startingAfter`, which answers
   oldest first) and trimmed to the window, so a capped read loses the oldest
   events of the window, never the newest. The events endpoint refuses
-  `perPage` below 3. Availability change history answers newest first and
+  `perPage` below 3. A page that is not full reaches back a month
+  (`pageStartAt`), and `prev` is offered forever, a month at a time, even
+  past the oldest event: `_read_events` is capped only when `pageStartAt`
+  is inside the window, and `list_events` treats an empty page as the end. Availability change history answers newest first and
   its `next` link pins `t0`/`t1`; `get_all` drops `timespan` then.
 - `events_dropped2` is an access point reporting it dropped `n` events of a
   high-volume type (`eventData.type`); it is reported as `[LOG-DROPPED]`,
