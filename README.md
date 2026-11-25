@@ -31,8 +31,9 @@ All tools are read-only (GET only) and annotated `readOnlyHint`.
 | Tool | What it answers |
 |---|---|
 | `health_check` | Server version, API key validity, organizations and networks in scope, device counts by status |
-| `daily_brief` | One-shot morning check of every network over the last 24 h: devices offline now or during the window, health alerts, connection success rate compared with the previous window, security and operational events, switch uplinks; CRITICAL / WARNING / OK |
+| `daily_brief` | One-shot morning check of every network over the last 24 h: devices offline now or during the window, health alerts, connection success rate compared with the previous window, wireless packet loss and channel use, security and operational events, switch uplinks; CRITICAL / WARNING / OK |
 | `connection_failures` | Failed wireless connections aggregated by step (assoc/auth/dhcp/dns), type, SSID, VLAN, access point and hour |
+| `wireless_quality` | Packet loss in each direction, access points with no traffic, channel utilization per band (Wi-Fi and non-Wi-Fi), best-effort latency; the worst access points of each |
 | `air_marshal` | Neighbouring SSIDs: totals, SSIDs seen on your wired LAN (rogues), SSIDs using one of your SSID names |
 | `availability_history` | Devices that went offline (or alerting/dormant) and came back: how often, for how long, still down or not |
 | `security_events` | Rogue/duplicate DHCP servers, AP spoofing, rogue AP association, IP/IPv6 conflicts, RA guard, loops, STP guards |

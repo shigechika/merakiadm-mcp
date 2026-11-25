@@ -258,6 +258,38 @@ def daily_routes(stats, events=(), ports=None, avail=None, changes=(), ops=(), p
     respx.get(f"{BASE}/organizations/100/switch/ports/statuses/bySwitch").mock(
         return_value=httpx.Response(200, json={"items": ports if ports is not None else [{"name": "sw-1", "ports": [{"portId": "49", "isUplink": True, "status": "Connected", "enabled": True}]}], "meta": {}})
     )
+    wireless_routes()
+
+
+def loss_rows():
+    def side(total, lost):
+        return {"total": total, "lost": lost, "lossPercentage": round(lost / total * 100, 1) if total else None}
+
+    return [
+        {"device": {"serial": "Q-AP1", "name": "ap-1"}, "upstream": side(10_000, 2_000), "downstream": side(20_000, 20)},
+        {"device": {"serial": "Q-AP2", "name": "ap-2"}, "upstream": side(50, 25), "downstream": side(40, 0)},
+        {"device": {"serial": "Q-AP3", "name": "ap-3"}, "upstream": side(0, 0), "downstream": side(0, 0)},
+    ]
+
+
+def wireless_routes(loss=None, use=None, latency=None):
+    respx.get(f"{BASE}/organizations/100/wireless/devices/packetLoss/byDevice").mock(
+        return_value=httpx.Response(200, json=loss if loss is not None else loss_rows())
+    )
+    band = lambda b, w, n: {"band": b, "wifi": {"percentage": w}, "nonWifi": {"percentage": n}, "total": {"percentage": w + n}}  # noqa: E731
+    respx.get(f"{BASE}/organizations/100/wireless/devices/channelUtilization/byDevice").mock(
+        return_value=httpx.Response(200, json=use if use is not None else [
+            {"serial": "Q-AP1", "byBand": [band("2.4", 40.0, 5.0), band("5", 10.0, 0.5)]},
+            {"serial": "Q-AP2", "byBand": [band("2.4", 20.0, 15.0), band("5", 6.0, 0.0)]},
+        ])
+    )
+    be = lambda avg, n: {"bestEffortTraffic": {"avg": avg, "rawDistribution": {"1": n}}}  # noqa: E731
+    respx.get(f"{BASE}/networks/N_1/wireless/devices/latencyStats").mock(
+        return_value=httpx.Response(200, json=latency if latency is not None else [
+            {"serial": "Q-AP1", "latencyStats": be(3.5, 500)},
+            {"serial": "Q-AP2", "latencyStats": be(90.0, 10)},
+        ])
+    )
 
 
 @respx.mock
@@ -270,6 +302,48 @@ def test_daily_brief_ok():
     assert "[SECURITY] none" in text
     assert "[OPERATIONS] none" in text
     assert "[UPLINK] 1 switches, 1 uplink ports, none down" in text
+    assert "[WIRELESS] packet loss client to AP (upstream) 20.1% of 10,050" in text
+    assert "worst upstream: ap-1 20.0%;" in text  # ap-2 carried too few packets to rank
+    assert "busiest channel: ap-1 2.4 GHz 45.0%" in text and "no traffic: ap-3" in text
+
+
+@respx.mock
+def test_daily_brief_reports_an_unreadable_wireless_line_without_raising_the_tier():
+    daily_routes({"assoc": 0, "auth": 1, "dhcp": 1, "dns": 0, "success": 98})
+    respx.get(f"{BASE}/organizations/100/wireless/devices/packetLoss/byDevice").mock(return_value=httpx.Response(404, json={"errors": ["Not found"]}))
+    text = server.daily_brief(hours=24, failure_threshold=10.0, top=3)
+    assert "1 OK, 0 WARNING, 0 CRITICAL" in text
+    assert "[WIRELESS] not read:" in text
+
+
+@respx.mock
+def test_wireless_quality_ranks_loss_channels_and_latency():
+    base_routes()
+    wireless_routes()
+    text = server.wireless_quality(hours=24, top=5, min_packets=1000)
+    assert text.startswith("# Wireless quality — Example Net (last 24h)")
+    assert "Access points reported: 3; carried no traffic: 1 (ap-3)" in text
+    assert "Upstream loss (client to AP), worst 1 of 1 with any loss and at least 1,000 packets" in text
+    assert "- ap-1: 20.0% (2,000 of 10,000)" in text
+    assert "ap-2: 50.0%" not in text
+    assert "- 2.4 GHz: 2 radios, average 40.0%, highest 45.0%" in text
+    assert "- ap-1 2.4 GHz: 45.0% (Wi-Fi 40.0%, non-Wi-Fi 5.0%)" in text
+    assert "Most non-Wi-Fi interference: ap-2 2.4 GHz 15.0%" in text
+    assert "- ap-1: 3.5 ms (500 samples)" in text and "90.0 ms" not in text
+    assert "- ap-1: <0.1% (20 of 20,000)" not in text  # 0.1% is shown as is
+    assert "Downstream loss (AP to client), worst 1 of 1" in text and "- ap-1: 0.1% (20 of 20,000)" in text
+    assert server._pct(1, 7_750) == "<0.1%" and server._pct(0, 10) == "0.0%" and server._pct(0, 0) == "n/a"
+    assert "more radios not listed" not in text
+    assert "- capped: 3 more radios not listed" in server.wireless_quality(hours=24, top=1)
+    small = server.wireless_quality(hours=24, top=5, min_packets=10)
+    assert "- ap-2: 50.0% (25 of 50)" in small
+
+
+@respx.mock
+def test_wireless_quality_needs_a_wireless_network():
+    base_routes(nets=({**NET, "productTypes": ["switch"]},))
+    with pytest.raises(ToolError, match="no wireless devices"):
+        server.wireless_quality()
 
 
 @respx.mock

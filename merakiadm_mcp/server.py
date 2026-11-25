@@ -111,6 +111,10 @@ OPERATIONAL_WARN_TYPES = frozenset(
 )
 EVENT_PRODUCT_TYPES = ("wireless", "switch", "appliance", "camera", "cellularGateway", "sensor")
 FAILURE_STEPS = ("assoc", "auth", "dhcp", "dns")
+#: Packets an access point must carry before its loss percentage is ranked.
+MIN_LOSS_PACKETS = 1000
+#: Latency samples an access point must have before its average is ranked.
+MIN_LATENCY_SAMPLES = 100
 MAX_HOURS = 168  # the failed-connection and connection-stats endpoints look back at most 7 days
 CACHE_SECONDS = 300
 MAX_BRIEF_NETWORKS = 25  # each network costs about ten requests and a section of output
@@ -588,7 +592,8 @@ def connection_failures(network: Optional[str] = None, hours: int = 24, top: int
 
     Reads the failed-connection log server-side and returns only aggregates
     (a day at a busy site is thousands of rows): totals per step (assoc /
-    auth / dhcp / dns) and per failure type, per SSID and VLAN, the ``top``
+    auth / dhcp / dns) from the connection stats, then from the separate
+    failed-connection log: per failure type, per SSID and VLAN, the ``top``
     access points by failures with their dominant step, the number of distinct
     clients, and failures per hour in the network's time zone.
 
@@ -607,11 +612,17 @@ def connection_failures(network: Optional[str] = None, hours: int = 24, top: int
     rows = _failed_connections(net, hours)
     summary, _ = _success_line(stats)
 
-    lines = [f"# Connection failures — {net.get('name')} (last {hours}h)", f"- Overall: {summary}{_trend(net, hours, stats)}"]
+    lines = [
+        f"# Connection failures — {net.get('name')} (last {hours}h)",
+        f"- Overall (connection stats): {summary}{_trend(net, hours, stats)}",
+    ]
     if not rows:
         lines.append("- No failed connections recorded in this window.")
         return "\n".join(lines)
-    lines.append(f"- Failed attempts listed: {len(rows):,} from {len({r.get('clientMac') for r in rows}):,} distinct clients")
+    lines.append(
+        f"- Failed-connection log: {len(rows):,} entries from {len({r.get('clientMac') for r in rows}):,} distinct clients"
+        " (a separate source: its count can differ a little from the overall line; the breakdowns below come from it)"
+    )
     lines.append(f"- By step: {_top(collections.Counter(r.get('failureStep') for r in rows), 10)}")
     lines.append(f"- By type: {_top(collections.Counter(r.get('type') for r in rows), 10)}")
     by_ssid = collections.Counter(ssids.get(r.get("ssidNumber"), str(r.get("ssidNumber"))) for r in rows)
@@ -1010,6 +1021,162 @@ def availability_history(network: Optional[str] = None, hours: int = 24, top: in
 
 
 # --------------------------------------------------------------------------
+# wireless quality
+# --------------------------------------------------------------------------
+
+
+def _require_wireless(net: dict) -> None:
+    if "wireless" not in (net.get("productTypes") or []):
+        raise ToolError(f"{net.get('name')} has no wireless devices")
+
+
+def _packet_loss(net: dict, hours: int) -> tuple[list[dict], bool]:
+    """Per access point packet loss, upstream (client to AP) and downstream."""
+    return _get_client().get_all(
+        f"/organizations/{net['organizationId']}/wireless/devices/packetLoss/byDevice",
+        {"networkIds[]": [net["id"]], "timespan": hours * 3600, "perPage": 1000},
+        10,
+    )
+
+
+def _channel_use(net: dict, hours: int) -> tuple[list[dict], bool]:
+    """Per access point channel utilization per band, averaged over the window."""
+    return _get_client().get_all(
+        f"/organizations/{net['organizationId']}/wireless/devices/channelUtilization/byDevice",
+        {"networkIds[]": [net["id"]], "timespan": hours * 3600, "interval": 3600, "perPage": 100},
+        20,
+    )
+
+
+def _pct(part: int, total: int) -> str:
+    """Percentage to one decimal; "<0.1%" rather than a misleading 0.0% when anything was lost."""
+    if not total:
+        return "n/a"
+    value = part / total * 100
+    return "<0.1%" if part and value < 0.05 else f"{value:.1f}%"
+
+
+def _loss_ranking(rows: list[dict], side: str, min_packets: int) -> list[tuple[str, dict]]:
+    """Access points with loss on ``side``, worst first, ignoring those under ``min_packets``."""
+    ranked = []
+    for r in rows:
+        d = r.get(side) or {}
+        total, lost = int(d.get("total") or 0), int(d.get("lost") or 0)
+        if total >= min_packets and lost:
+            ranked.append(((r.get("device") or {}).get("name") or (r.get("device") or {}).get("serial") or "?", d))
+    ranked.sort(key=lambda kv: -int(kv[1].get("lost") or 0) / int(kv[1].get("total") or 1))
+    return ranked
+
+
+def _loss_totals(rows: list[dict]) -> str:
+    sums = {}
+    for side in ("upstream", "downstream"):
+        total = sum(int((r.get(side) or {}).get("total") or 0) for r in rows)
+        lost = sum(int((r.get(side) or {}).get("lost") or 0) for r in rows)
+        sums[side] = f"{_pct(lost, total)} of {total:,}"
+    return f"client to AP (upstream) {sums['upstream']}, AP to client (downstream) {sums['downstream']}"
+
+
+def _idle(rows: list[dict]) -> list[str]:
+    """Access points that carried no packets at all in the window."""
+    return sorted(
+        (r.get("device") or {}).get("name") or (r.get("device") or {}).get("serial") or "?"
+        for r in rows
+        if not int((r.get("upstream") or {}).get("total") or 0) and not int((r.get("downstream") or {}).get("total") or 0)
+    )
+
+
+def _band_rows(rows: list[dict], names: dict[str, str]) -> list[tuple[str, str, dict]]:
+    """(access point, band, {wifi, nonWifi, total}) for every band reported."""
+    out = []
+    for r in rows:
+        name = names.get(r.get("serial"), r.get("serial") or "?")
+        for b in r.get("byBand") or []:
+            out.append((name, str(b.get("band")), {k: float((b.get(k) or {}).get("percentage") or 0) for k in ("wifi", "nonWifi", "total")}))
+    return out
+
+
+def _band_label(band: str) -> str:
+    return f"{band} GHz"
+
+
+@mcp.tool()
+def wireless_quality(network: Optional[str] = None, hours: int = 24, top: int = 10, min_packets: int = MIN_LOSS_PACKETS) -> str:
+    """Summarize wireless quality per access point: packet loss, channel use, latency.
+
+    For "the Wi-Fi is slow or drops" questions. Over the window it reports
+    packet loss for the whole network and the ``top`` access points by loss in
+    each direction (upstream is client to AP, downstream is AP to client;
+    access points that carried fewer than ``min_packets`` packets are not
+    ranked, as a handful of packets gives a meaningless percentage), access
+    points that carried no traffic at all, channel utilization averaged over
+    the window per band (Wi-Fi and non-Wi-Fi interference), and the access
+    points with the highest average best-effort latency.
+
+    Args:
+        network: Network name or ID; may be omitted when only one is in scope.
+        hours: Look-back window, 1-168 (default 24).
+        top: How many access points to list per section (1-50, default 10).
+        min_packets: Packets an access point must carry to be ranked by loss (1-1000000, default 1000).
+    """
+    net = _one_network(network)
+    _require_wireless(net)
+    hours = _bound(hours, 1, MAX_HOURS)
+    top = _bound(top, 1, 50)
+    min_packets = _bound(min_packets, 1, 1_000_000)
+    names, names_capped = _device_names(net["organizationId"])
+    lines = [f"# Wireless quality — {net.get('name')} (last {hours}h)"]
+    if names_capped:
+        lines.append(f"- {NAMES_CAPPED}")
+
+    loss, loss_capped = _packet_loss(net, hours)
+    lines.append(f"- Packet loss, whole network: {_loss_totals(loss)}{' (capped: more access points not read)' if loss_capped else ''}")
+    idle = _idle(loss)
+    lines.append(
+        f"- Access points reported: {len(loss)}; carried no traffic: {len(idle)}"
+        + (f" ({', '.join(idle[:top])}{f' … capped: {len(idle) - top} more' if len(idle) > top else ''})" if idle else "")
+    )
+    for side, title in (("upstream", "Upstream loss (client to AP)"), ("downstream", "Downstream loss (AP to client)")):
+        ranked = _loss_ranking(loss, side, min_packets)
+        lines.append(f"\n## {title}, worst {min(top, len(ranked))} of {len(ranked)} with any loss and at least {min_packets:,} packets")
+        for name, d in ranked[:top]:
+            lost, total = int(d.get("lost") or 0), int(d.get("total") or 0)
+            lines.append(f"- {name}: {_pct(lost, total)} ({lost:,} of {total:,})")
+        if len(ranked) > top:
+            lines.append(f"- capped: {len(ranked) - top} more access points not listed (raise top=)")
+
+    use, use_capped = _channel_use(net, hours)
+    bands = _band_rows(use, names)
+    lines.append(f"\n## Channel utilization, average over the window{' (capped: more access points not read)' if use_capped else ''}")
+    for band in sorted({b for _, b, _ in bands}, key=lambda b: float(b) if b.replace('.', '', 1).isdigit() else 99):
+        vals = [v for _, b, v in bands if b == band]
+        avg = sum(v["total"] for v in vals) / len(vals)
+        lines.append(f"- {_band_label(band)}: {len(vals)} radios, average {avg:.1f}%, highest {max(v['total'] for v in vals):.1f}%")
+    busiest = sorted(bands, key=lambda x: -x[2]["total"])
+    for name, band, v in busiest[:top]:
+        lines.append(f"- {name} {_band_label(band)}: {v['total']:.1f}% (Wi-Fi {v['wifi']:.1f}%, non-Wi-Fi {v['nonWifi']:.1f}%)")
+    if len(busiest) > top:
+        lines.append(f"- capped: {len(busiest) - top} more radios not listed (raise top=)")
+    if bands:
+        name, band, v = max(bands, key=lambda x: x[2]["nonWifi"])
+        lines.append(f"- Most non-Wi-Fi interference: {name} {_band_label(band)} {v['nonWifi']:.1f}%")
+
+    latency = _get_client().get(f"/networks/{net['id']}/wireless/devices/latencyStats", {"timespan": hours * 3600}) or []
+    slow = []
+    for r in latency:
+        be = (r.get("latencyStats") or {}).get("bestEffortTraffic") or {}
+        samples = sum(int(n or 0) for n in (be.get("rawDistribution") or {}).values())
+        if samples >= MIN_LATENCY_SAMPLES and be.get("avg") is not None:
+            slow.append((names.get(r.get("serial"), r.get("serial") or "?"), float(be["avg"]), samples))
+    slow.sort(key=lambda x: -x[1])
+    lines.append(f"\n## Best-effort latency, highest average {min(top, len(slow))} of {len(slow)} with at least {MIN_LATENCY_SAMPLES} samples")
+    lines.extend(f"- {name}: {avg:.1f} ms ({samples:,} samples)" for name, avg, samples in slow[:top])
+    if len(slow) > top:
+        lines.append(f"- capped: {len(slow) - top} more access points not listed (raise top=)")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
 # switch uplinks
 # --------------------------------------------------------------------------
 
@@ -1039,6 +1206,30 @@ def _uplink_problems(switches: list[dict]) -> tuple[int, list[str]]:
 # --------------------------------------------------------------------------
 
 
+def _wireless_line(net: dict, hours: int, top: int) -> str:
+    """The [WIRELESS] line of daily_brief; an API error here is reported, not raised."""
+    try:
+        loss, loss_capped = _packet_loss(net, hours)
+        use, use_capped = _channel_use(net, hours)
+        names, _ = _device_names(net["organizationId"])
+    except MerakiAPIError as exc:
+        return f"- [WIRELESS] not read: {exc}"
+    parts = [f"packet loss {_loss_totals(loss)}"]
+    worst = _loss_ranking(loss, "upstream", MIN_LOSS_PACKETS)[:top]
+    if worst:
+        parts.append("worst upstream: " + ", ".join(f"{n} {_pct(int(d.get('lost') or 0), int(d.get('total') or 0))}" for n, d in worst))
+    bands = _band_rows(use, names)
+    if bands:
+        name, band, v = max(bands, key=lambda x: x[2]["total"])
+        parts.append(f"busiest channel: {name} {_band_label(band)} {v['total']:.1f}%")
+    idle = _idle(loss)
+    if idle:
+        parts.append(f"no traffic: {', '.join(idle[:top])}{f' … capped: {len(idle) - top} more' if len(idle) > top else ''}")
+    if loss_capped or use_capped:
+        parts.append("capped: more access points not read")
+    return "- [WIRELESS] " + "; ".join(parts) + " — see wireless_quality"
+
+
 @mcp.tool()
 def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) -> str:
     """Morning health check of every network in scope.
@@ -1050,6 +1241,9 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
     - [CONNECT] wireless success rate, failures per step, the previous
       window of the same length for comparison, and [CONNECT-TOP-AP] when
       failures exceed ``failure_threshold``
+    - [WIRELESS] packet loss, the worst access points by upstream loss,
+      the busiest channel and access points with no traffic (see
+      wireless_quality); informational, it does not change the tier
     - [SECURITY] security event counts (see security_events)
     - [OPERATIONS] rare operational events: reboots, RADIUS/DHCP trouble,
       radar, attacks, switch faults, dropped log entries (see operational_events)
@@ -1149,6 +1343,10 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
                     names, names_capped = _device_names(org_id)
                     per_ap = collections.Counter(names.get(r.get("serial"), r.get("serial")) for r in _failed_connections(net, hours))
                     body.append(f"- [CONNECT-TOP-AP] {_top(per_ap, top)}{' (' + NAMES_CAPPED + ')' if names_capped else ''}")
+
+            step()
+            if "wireless" in products:
+                body.append(_wireless_line(net, hours, top))
 
             step()
             events, capped = _collect_events(net, list(SECURITY_EVENT_TYPES), hours)

@@ -21,12 +21,14 @@ not healthy. Degraded means a device is offline or alerting.
 
 Per network: `[DEVICES]`, `[DEVICES-DOWN]`, `[AVAILABILITY]`, `[HEALTH]`,
 `[CONNECT]` / `[CONNECT-HIGH-FAILURE]` (with the previous window of the same
-length when `hours` is 84 or less) and `[CONNECT-TOP-AP]`, `[SECURITY]`,
+length when `hours` is 84 or less) and `[CONNECT-TOP-AP]`, `[WIRELESS]`, `[SECURITY]`,
 `[OPERATIONS]` / `[OPERATIONS-WARN]`, `[LOG-DROPPED]`, `[UPLINK]` / `[UPLINK-DOWN]`, or
 `[API-ERROR]`. Each network is CRITICAL (API error), WARNING (device down now
 or during the window, failures above the threshold, any security event, a
 warning-level operational event, an uplink down) or OK. Switch ports are only checked when the switch flags them
-as uplinks. At most 25 networks, and only those started within 40 seconds, are checked
+as uplinks. `[WIRELESS]` (packet loss, the worst access points by upstream loss, the
+busiest channel, access points with no traffic) is informational and never changes
+the tier; when it cannot be read it says `not read`. At most 25 networks, and only those started within 40 seconds, are checked
 per call; the rest are reported as `capped`. A network still running at
 50 seconds stops between steps and says so.
 
@@ -38,9 +40,28 @@ per call; the rest are reported as `capped`. A network still running at
 | `hours` | 24 | 1-168 |
 | `top` | 10 | 1-50 access points |
 
-Overall success rate, failures by step, type, SSID and VLAN, distinct
+Overall success rate and failures by step, from the connection stats. Then,
+from the failed-connection log (a separate source whose count can differ a
+little from the overall line): failures by step, type, SSID and VLAN, distinct
 clients (counted, not listed), top access points with their failure steps,
 failures per local hour.
+
+## wireless_quality
+
+| Argument | Default | Range |
+|---|---|---|
+| `network` | the only network in scope | name or ID |
+| `hours` | 24 | 1-168 |
+| `top` | 10 | 1-50 access points per section |
+| `min_packets` | 1000 | 1-1000000 packets an access point must carry to be ranked by loss |
+
+Packet loss for the whole network, upstream (client to AP) and downstream
+(AP to client); access points that carried no traffic; the worst access
+points by loss in each direction; channel utilization averaged over the
+window, per band and for the busiest radios, split into Wi-Fi and non-Wi-Fi
+(interference); the access points with the highest average best-effort
+latency (only those with at least 100 samples). Loss below 0.1% is shown as
+`<0.1%`, never `0.0%`.
 
 ## availability_history
 

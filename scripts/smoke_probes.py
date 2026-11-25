@@ -57,6 +57,13 @@ PROBES: dict[str, Probe] = {
         must_not_match=NO_ERROR,
         timeout=120,
     ),
+    "wireless_quality": Probe(
+        args_factory=_single_network,
+        args={"hours": 1, "top": 3},
+        must_match=(r"^# Wireless quality — ",),
+        must_not_match=NO_ERROR,
+        timeout=120,
+    ),
     "air_marshal": Probe(
         args_factory=_single_network,
         args={"hours": 1, "top": 3},
