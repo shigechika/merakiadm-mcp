@@ -254,7 +254,7 @@ def test_daily_brief_ok():
     text = server.daily_brief(hours=24, failure_threshold=10.0, top=3)
     assert text.startswith("## daily_brief — ")
     assert "1 networks: 1 OK, 0 WARNING, 0 CRITICAL" in text
-    assert "[AVAILABILITY] no device left online (0 status changes)" in text
+    assert "[AVAILABILITY] every device stayed online (0 status changes)" in text
     assert "[SECURITY] none" in text
     assert "[OPERATIONS] none" in text
     assert "[UPLINK] 1 switches, 1 uplink ports, none down" in text
@@ -365,7 +365,7 @@ def test_availability_history_pairs_outages():
     )
     text = server.availability_history(hours=24, top=5)
     assert "- Status changes: 5" in text
-    assert "- Devices that left online: 2" in text
+    assert "- Devices not online at some point: 2 (left online during the window: 2)" in text
     assert "- ap-1 2x 15 min" in text
     assert "ap-2 1x 30 min" in text and "still down" in text
 
@@ -398,7 +398,7 @@ def test_daily_brief_reports_outages_operations_and_trend():
     )
     text = server.daily_brief(hours=24, failure_threshold=50.0, top=3)
     assert "0 OK, 1 WARNING" in text
-    assert "[AVAILABILITY] 1 device(s) left online: ap-1 1x 10 min" in text
+    assert "[AVAILABILITY] 1 device(s) not online at some point: ap-1 1x 10 min" in text
     assert "(previous 24h: 3.0% failed; biggest change: dhcp +7)" in text
     assert "[OPERATIONS-WARN] 8021x_radius_timeout 2" in text
     assert "[OPERATIONS] dfs_event 2, events_dropped2 2 (events_dropped2:" in text
@@ -428,6 +428,7 @@ def test_device_down_at_window_start_is_not_a_new_outage():
     )
     text = server.availability_history(hours=1, top=5)
     assert "- ap-1 0x 20 min (down at window start" in text
+    assert "(left online during the window: 0)" in text
 
 
 @respx.mock
@@ -438,4 +439,4 @@ def test_brief_says_when_availability_history_was_cut():
         return_value=httpx.Response(200, json=[], headers={"Link": nxt})
     )
     text = server.daily_brief(hours=24, failure_threshold=10.0, top=3)
-    assert "no device left online in the 0 status changes read (capped" in text
+    assert "every device stayed online in the 0 status changes read (capped" in text

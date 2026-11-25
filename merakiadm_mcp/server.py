@@ -831,6 +831,9 @@ def _outages(net: dict, hours: int) -> tuple[list[dict], int, bool]:
                 row["down_since"] = ts
     rows = []
     for row in per.values():
+        # With a capped history an earlier online->offline change may be unread, so the
+        # state at the window start is a guess, not a fact.
+        row["start_unknown"] = capped and row["from_start"]
         if row["down_since"] is not None:
             row["seconds"] += (now - max(row["down_since"], start)).total_seconds()
         if row["downs"] or row["seconds"] or row["from_start"]:
@@ -840,7 +843,10 @@ def _outages(net: dict, hours: int) -> tuple[list[dict], int, bool]:
 
 
 def _outage_text(row: dict, tz) -> str:
-    notes = ["down at window start"] if row["from_start"] else []
+    if row["start_unknown"]:
+        notes = ["state at window start unknown: history capped"]
+    else:
+        notes = ["down at window start"] if row["from_start"] else []
     notes.append(f"last change {_local(row['last'], tz)}")
     if row["still_down"]:
         notes.append("still down")
@@ -870,7 +876,7 @@ def availability_history(network: Optional[str] = None, hours: int = 24, top: in
     lines = [
         f"# Availability history — {net.get('name')} (last {hours}h)",
         f"- Status changes: {changes:,}{' (capped: more changes not read; shorten hours=)' if capped else ''}",
-        f"- Devices that left online: {len(rows):,}",
+        f"- Devices not online at some point: {len(rows):,} (left online during the window: {sum(1 for r in rows if r['downs']):,})",
     ]
     if rows:
         lines.append(f"\n## Devices ({min(top, len(rows))} of {len(rows)})")
@@ -978,15 +984,15 @@ def daily_brief(hours: int = 24, failure_threshold: float = 10.0, top: int = 5) 
             if outages:
                 tier = "WARNING"
                 body.append(
-                    f"- [AVAILABILITY] {len(outages)} device(s) left online: "
+                    f"- [AVAILABILITY] {len(outages)} device(s) not online at some point: "
                     + "; ".join(_outage_text(r, _tz(net)) for r in outages[:top])
                     + (f" … capped: {len(outages) - top} more" if len(outages) > top else "")
                     + (" (capped: more changes not read)" if outage_capped else "")
                 )
             elif outage_capped:
-                body.append(f"- [AVAILABILITY] no device left online in the {changes} status changes read (capped: more changes not read)")
+                body.append(f"- [AVAILABILITY] every device stayed online in the {changes} status changes read (capped: more changes not read)")
             else:
-                body.append(f"- [AVAILABILITY] no device left online ({changes} status changes)")
+                body.append(f"- [AVAILABILITY] every device stayed online ({changes} status changes)")
 
             alerts = _get_client().get(f"/networks/{net['id']}/health/alerts") or []
             if alerts:

@@ -49,9 +49,11 @@ failures per local hour.
 | `hours` | 24 | 1-168 |
 | `top` | 20 | 1-100 devices |
 
-From the availability change history: for each device that left online,
-how many times, minutes not online within the window, last change, and
-whether it is still down.
+From the availability change history: for each device that was not online
+at some point in the window, how many times it left online, minutes not
+online within the window, whether it was already down when the window began
+(reported as unknown when the history was capped), last change, and whether
+it is still down.
 
 ## air_marshal
 
