@@ -163,7 +163,7 @@ operation's summary, description and parameters.
 | `offset` | 0 | first list item |
 | `limit` | 20 | 1-200 list items |
 | `max_chars` | 20000 | 2000-60000 characters |
-| `max_pages` | 1 | 1-5 pages, following next links within 30 seconds |
+| `max_pages` | 1 | 1-5 pages; no further page is started after 20 seconds, and a page that fails ends the read with `page_error` and the pages before it |
 
 `params` and `fields` are also accepted as JSON-encoded strings (some
 clients send them that way); `fields` also as a comma-separated string.

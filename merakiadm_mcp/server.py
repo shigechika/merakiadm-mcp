@@ -34,6 +34,7 @@ from mcp.types import ToolAnnotations
 
 from merakiadm_mcp import __version__
 from merakiadm_mcp.client import (
+    CURSOR_PARAMS,
     DEFAULT_BASE_URL,
     MerakiAPIError,
     MerakiClient,
@@ -1280,7 +1281,9 @@ def _client_matches(net: dict, query: str, hours: int) -> tuple[list[dict], str,
         return ([{**r, "id": cid, "mac": found.get("mac") or mac, "manufacturer": found.get("manufacturer")} for r in rows][:1], "MAC", False)
     if _is_ip(q):
         key = "ip" if ipaddress.ip_address(q).version == 4 else "ip6"
-        rows = _get_client().get(f"/networks/{net['id']}/clients", {key: q, "timespan": hours * 3600, "perPage": 100}) or []
+        rows, capped = _get_client().get_all(
+            f"/networks/{net['id']}/clients", {key: q, "timespan": hours * 3600, "perPage": 1000}, CLIENT_SCAN_PAGES
+        )
         wanted = ipaddress.ip_address(q)
         exact = []
         for r in rows:  # the API matches a prefix: 10.0.0.9 also returns 10.0.0.95
@@ -1289,7 +1292,7 @@ def _client_matches(net: dict, query: str, hours: int) -> tuple[list[dict], str,
                     exact.append(r)
             except ValueError:
                 continue
-        return exact, f"IP over the last {hours}h", False
+        return exact, f"IP over the last {hours}h", capped and not exact
     needle = q.lower()
     rows, capped = _get_client().get_all(
         f"/networks/{net['id']}/clients", {"timespan": hours * 3600, "perPage": 1000}, CLIENT_SCAN_PAGES
@@ -1431,7 +1434,7 @@ API_INDEX_SECONDS = 6 * 3600
 API_MAX_CHARS = 20_000
 API_MAX_PAGES = 5
 _SERIAL_KEY = re.compile(r"(^serial|Serial)$")
-API_PAGES_SECONDS = 30.0
+API_PAGES_SECONDS = 20.0  # no further page is started after this; a page itself may take up to the client timeout
 NOTE_CAPPED = "part of the answer was left out: use fields=, offset=/limit= or narrower params"
 REDACTED = "[redacted]"
 #: A key is secret when its lower-cased name contains one of these. Booleans stay.
@@ -1469,7 +1472,12 @@ def _api_index(cached_only: bool = False) -> Optional[list[dict]]:
     hit = _cache.get("api-index")
     if hit and time.monotonic() - hit[0] < API_INDEX_SECONDS:
         return hit[1]
-    org_id = str(_organizations()[0]["id"])
+    orgs = _organizations()
+    if not orgs:
+        if cached_only:
+            return None
+        raise ToolError("no organization is visible to this API key, so there is no OpenAPI spec to search")
+    org_id = str(orgs[0]["id"])
     path = _index_file(org_id)
     try:
         if path and time.time() - path.stat().st_mtime < API_INDEX_SECONDS:
@@ -1792,11 +1800,13 @@ def _name_serials(node: Any) -> Any:
     if not serials:
         return node
     names: dict[str, str] = {}
+    in_scope = {n["id"] for n in _networks()}
     for org in _organizations():
         try:
-            names.update(_device_names(str(org["id"]))[0])
+            devices, _ = _devices(str(org["id"]))
         except MerakiAPIError:
-            pass
+            continue
+        names.update({d["serial"]: d.get("name") or d["serial"] for d in devices if d.get("serial") and d.get("networkId") in in_scope})
 
     def add(n: Any) -> Any:
         if isinstance(n, dict):
@@ -1872,6 +1882,7 @@ def api_get(
     observed_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     pages_read = 1
+    page_error = ""
     if segments == ["organizations"]:
         data: Any = _organizations()
         page_links: dict = {}
@@ -1881,10 +1892,15 @@ def api_get(
         started = time.monotonic()
         while pages_read < max_pages and page_links.get("next") and time.monotonic() - started < API_PAGES_SECONDS:
             nxt = page_links["next"]
-            follow = {**query, **nxt}
+            follow = {k: v for k, v in query.items() if k not in CURSOR_PARAMS}
+            follow.update(nxt)
             if "t0" in nxt or "t1" in nxt:
                 follow.pop("timespan", None)
-            more = _get_client().page(path, follow)
+            try:
+                more = _get_client().page(path, follow)
+            except (MerakiAPIError, httpx.HTTPError) as exc:
+                page_error = f"page {pages_read + 1} could not be read ({exc}); the pages before it are returned"
+                break
             merged = _merge_pages(data, more.data)
             if merged is None:
                 break
@@ -1905,6 +1921,8 @@ def api_get(
     if pages_read > 1 or max_pages > 1:
         result["pages_read"] = pages_read
     result["has_next_page"] = bool(page_links.get("next"))
+    if page_error:
+        result["page_error"] = page_error
     if redacted[0]:
         result["redacted"] = redacted[0]
     for rel in ("next", "prev"):

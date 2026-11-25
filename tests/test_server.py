@@ -30,9 +30,9 @@ NET = {
     "timeZone": "Asia/Tokyo",
 }
 DEVICES = [
-    {"serial": "Q-AP1", "name": "ap-1", "productType": "wireless"},
-    {"serial": "Q-AP2", "name": "ap-2", "productType": "wireless"},
-    {"serial": "Q-SW1", "name": "sw-1", "productType": "switch"},
+    {"serial": "Q-AP1", "name": "ap-1", "productType": "wireless", "networkId": "N_1"},
+    {"serial": "Q-AP2", "name": "ap-2", "productType": "wireless", "networkId": "N_1"},
+    {"serial": "Q-SW1", "name": "sw-1", "productType": "switch", "networkId": "N_1"},
 ]
 SSIDS = [
     {"number": 0, "name": "CorpNet", "enabled": True},
@@ -894,6 +894,49 @@ def test_find_client_by_ip_keeps_only_the_exact_address():
 
 def test_other_serial_keys_get_a_name(monkeypatch):
     monkeypatch.setattr(server, "_organizations", lambda: [ORG])
-    monkeypatch.setattr(server, "_device_names", lambda org: ({"Q-AP1": "ap-1"}, False))
+    monkeypatch.setattr(server, "_networks", lambda: [NET])
+    monkeypatch.setattr(server, "_devices", lambda org: ([{"serial": "Q-AP1", "name": "ap-1", "networkId": "N_1"}], False))
     assert server._name_serials([{"recentDeviceSerial": "Q-AP1"}, {"deviceSerial": "Q-AP1"}]) == [
         {"recentDeviceSerial": "Q-AP1", "recentDeviceName": "ap-1"}, {"deviceSerial": "Q-AP1", "deviceName": "ap-1"}]
+
+
+def test_device_names_stay_in_the_network_scope(monkeypatch):
+    monkeypatch.setattr(server, "_organizations", lambda: [ORG])
+    monkeypatch.setattr(server, "_networks", lambda: [NET])
+    monkeypatch.setattr(server, "_devices", lambda org: ([{"serial": "Q-IN", "name": "in", "networkId": "N_1"}, {"serial": "Q-OUT", "name": "out", "networkId": "N_9"}], False))
+    assert server._name_serials([{"serial": "Q-IN"}, {"serial": "Q-OUT"}]) == [{"serial": "Q-IN", "deviceName": "in"}, {"serial": "Q-OUT"}]
+
+
+@respx.mock
+def test_api_get_follows_pages_with_the_next_cursor_only_and_keeps_pages_read_before_an_error():
+    base_routes()
+    calls = []
+
+    def answer(request):
+        calls.append(dict(request.url.params))
+        if "startingAfter" in request.url.params:
+            return httpx.Response(400, json={"errors": ["bad page"]})
+        return httpx.Response(200, json=[{"x": 1}], headers={"Link": f'<{BASE}/networks/N_1/clients?startingAfter=z>; rel=next'})
+
+    respx.get(f"{BASE}/networks/N_1/clients").mock(side_effect=answer)
+    result = server.api_get("/networks/N_1/clients", params={"endingBefore": "a", "timespan": 60}, max_pages=3)
+    assert calls[1] == {"timespan": "60", "startingAfter": "z"}
+    assert result["data"] == [{"x": 1}] and "page_error" in result and result["pages_read"] == 1
+
+
+@respx.mock
+def test_api_get_answers_without_an_index_when_no_organization_is_visible():
+    respx.get(f"{BASE}/organizations").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{BASE}/networks").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{BASE}/administered/identities/me").mock(return_value=httpx.Response(200, json={"name": "me"}))
+    assert server.api_get("/administered/identities/me")["data"] == {"name": "me"}
+
+
+@respx.mock
+def test_find_client_by_ip_reads_further_pages_for_the_exact_address():
+    base_routes()
+    link = f'<{BASE}/networks/N_1/clients?startingAfter=p2>; rel=next'
+    respx.get(f"{BASE}/networks/N_1/clients").mock(side_effect=lambda r: httpx.Response(200, json=[{"id": "k2", "mac": "m2", "ip": "10.0.0.9", "lastSeen": 1}])
+        if r.url.params.get("startingAfter") else httpx.Response(200, json=[{"id": "k1", "mac": "m1", "ip": "10.0.0.95"}], headers={"Link": link}))
+    respx.get(f"{BASE}/networks/N_1/clients/k2").mock(return_value=httpx.Response(200, json={"id": "k2", "mac": "m2", "ip": "10.0.0.9"}))
+    assert "IP 10.0.0.9," in server.find_client("10.0.0.9")
