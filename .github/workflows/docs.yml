@@ -1,7 +1,8 @@
 name: Docs
 
 # Build the MkDocs site on every docs PR (--strict, so broken links/config
-# fail the check) and deploy it to GitHub Pages on push to main. Pages is
+# fail the check) and deploy it to GitHub Pages on a push to main or a manual
+# run on main (a manual run on another branch only builds). Pages is
 # configured with Source: "GitHub Actions", so deployment goes through the
 # official pages artifact flow — no gh-pages branch.
 
@@ -22,10 +23,11 @@ on:
 permissions:
   contents: read
 
-# Deployments share one group so they never overlap; each pull request builds
-# in its own group so a PR build cannot displace a queued deployment.
+# Runs that deploy (not a pull request, on main) share one group so they never
+# overlap. Every other run only builds and gets a group of its own ref, so it
+# cannot displace a queued deployment.
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('pages-pr-{0}', github.event.pull_request.number) || 'pages' }}
+  group: ${{ (github.event_name != 'pull_request' && github.ref == 'refs/heads/main') && 'pages' || format('pages-build-{0}', github.ref) }}
   cancel-in-progress: false
 
 jobs:

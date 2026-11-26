@@ -56,11 +56,24 @@ mcp-stdio serve --enable-oauth \
   --public-url https://meraki.example.com \
   --trusted-user-header X-Forwarded-User \
   --allow-redirect-uri https://claude.ai/api/mcp/auth_callback \
+  --token-store ~/.local/state/merakiadm-mcp/tokens.json \
+  --session-idle-ttl 180 --max-sessions-per-owner 3 \
   --port 8080 -- merakiadm-mcp
 ```
 
-利用者をサインインさせて（手元の SSO）、利用者名を `X-Forwarded-User` で渡す
-TLS のリバースプロキシの後ろで動かします。プロキシは、クライアントが送って
+利用者をサインインさせて（手元の SSO）、Dashboard を読んでよい人だけを通し、
+利用者名を `X-Forwarded-User` で渡す TLS のリバースプロキシの後ろで動かします。
+どのセッションも同じ 1 本の API キーで動くので、プロキシを通った人は全員、
+そのキーで読めるものをすべて読めます。キーが属する組織の全部です
+（`MERAKI_ORG_ID` / `MERAKI_NETWORK_IDS` で絞っていればその範囲）。
+サインインできるだけでは足りず、プロキシで誰を通すかを絞る必要があります。`--token-store` は発行したトークンを再起動を
+またいで残します（無いと再起動のたびに利用者のつなぎ直しが要ります。この
+ファイルは認証情報なので、サービスのアカウントだけが読めるようにし、その
+アカウントが書ける場所に置きます。systemd なら `~` ではなく `StateDirectory=`
+の下です）。セッションの 2 つのオプションは、クライアントが残していった
+セッションを片付けます。利用者ごとの上限は、超えたときにその利用者の
+いちばん長く使っていないセッションも閉じるので、1 人が同時に使う端末の数に
+合わせてください。プロキシは、クライアントが送って
 きた `X-Forwarded-User` を必ず取り除いてください。mcp-stdio はこのヘッダを
 信じるので、素通しになると、クライアントが別の利用者になりすませます。
 上の例のように、専用のホスト名を使ってください。mcp-stdio の文書に、claude.ai
