@@ -56,11 +56,19 @@ mcp-stdio serve --enable-oauth \
   --public-url https://meraki.example.com \
   --trusted-user-header X-Forwarded-User \
   --allow-redirect-uri https://claude.ai/api/mcp/auth_callback \
+  --token-store /var/lib/merakiadm-mcp/tokens.json \
+  --session-idle-ttl 180 --max-sessions-per-owner 3 \
   --port 8080 -- merakiadm-mcp
 ```
 
-Run it behind a TLS reverse proxy that signs users in (your SSO) and passes
-the user name in `X-Forwarded-User`. The proxy must strip any
+Run it behind a TLS reverse proxy that signs users in (your SSO), admits
+only the people who may read the Dashboard, and passes the user name in
+`X-Forwarded-User`. Every session runs with the one API key, so everyone the
+proxy lets through gets that key's read access to the whole organization:
+signing in is not enough, the proxy has to authorize too. `--token-store`
+keeps issued tokens across restarts (without it every restart makes users
+reconnect), and the two session options clear out sessions a client left
+behind. The proxy must strip any
 `X-Forwarded-User` header a client sends: mcp-stdio trusts that header, so
 a copy that gets through lets a client pose as another user. Give the server
 its own host name, as above: mcp-stdio's documentation notes that claude.ai
