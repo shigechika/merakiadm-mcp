@@ -5,7 +5,6 @@
       "release-type": "python",
       "package-name": "merakiadm-mcp",
       "include-component-in-tag": false,
-      "release-as": "0.0.1",
       "extra-files": [
         {
           "type": "generic",

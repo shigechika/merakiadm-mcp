@@ -6,6 +6,7 @@ name: Docs
 # official pages artifact flow — no gh-pages branch.
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
@@ -21,8 +22,10 @@ on:
 permissions:
   contents: read
 
+# Deployments share one group so they never overlap; each pull request builds
+# in its own group so a PR build cannot displace a queued deployment.
 concurrency:
-  group: pages
+  group: ${{ github.event_name == 'pull_request' && format('pages-pr-{0}', github.event.pull_request.number) || 'pages' }}
   cancel-in-progress: false
 
 jobs:
@@ -47,13 +50,13 @@ jobs:
         run: mkdocs build --strict
 
       - name: Upload Pages artifact
-        if: github.event_name == 'push'
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
   deploy:
-    if: github.event_name == 'push'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
     permissions:
