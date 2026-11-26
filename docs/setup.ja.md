@@ -56,7 +56,7 @@ mcp-stdio serve --enable-oauth \
   --public-url https://meraki.example.com \
   --trusted-user-header X-Forwarded-User \
   --allow-redirect-uri https://claude.ai/api/mcp/auth_callback \
-  --token-store /var/lib/merakiadm-mcp/tokens.json \
+  --token-store ~/.local/state/merakiadm-mcp/tokens.json \
   --session-idle-ttl 180 --max-sessions-per-owner 3 \
   --port 8080 -- merakiadm-mcp
 ```
@@ -66,7 +66,8 @@ mcp-stdio serve --enable-oauth \
 どのセッションも同じ 1 本の API キーで動くので、プロキシを通った人は全員、
 そのキーで組織全体を読めます。サインインできるだけでは足りず、プロキシで
 誰を通すかを絞る必要があります。`--token-store` は発行したトークンを再起動を
-またいで残します（無いと再起動のたびに利用者のつなぎ直しが要ります）。
+またいで残します（無いと再起動のたびに利用者のつなぎ直しが要ります。この
+ファイルは認証情報なので、サービスのアカウントだけが読めるようにします）。
 セッションの 2 つのオプションは、クライアントが残していったセッションを
 片付けます。プロキシは、クライアントが送って
 きた `X-Forwarded-User` を必ず取り除いてください。mcp-stdio はこのヘッダを
