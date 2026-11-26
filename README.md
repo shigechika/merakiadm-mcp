@@ -92,6 +92,31 @@ claude mcp add merakiadm --env MERAKI_DASHBOARD_API_KEY=... -- uvx merakiadm-mcp
 }
 ```
 
+### claude.ai (web, desktop and mobile)
+
+claude.ai connects to remote MCP servers over HTTP with OAuth, and this
+server speaks stdio. [mcp-stdio](https://github.com/shigechika/mcp-stdio)'s
+`serve` mode bridges the two: it exposes a stdio server as a Streamable HTTP
+endpoint with an embedded OAuth 2.1 authorization server, and starts one
+`merakiadm-mcp` process per session. The API key stays on that host.
+
+```bash
+export MERAKI_DASHBOARD_API_KEY=...
+mcp-stdio serve --enable-oauth \
+  --public-url https://mcp.example.com/meraki \
+  --trusted-user-header X-Forwarded-User \
+  --allow-redirect-uri https://claude.ai/api/mcp/auth_callback \
+  --port 8080 -- merakiadm-mcp
+```
+
+Run it behind a TLS reverse proxy that signs users in (your SSO) and passes
+the user name in `X-Forwarded-User`; see the mcp-stdio documentation for the
+options. Then add `https://mcp.example.com/meraki/mcp` as a custom connector
+in claude.ai. The same connector works in the browser, the desktop app and
+the mobile apps, so the morning check or a "where is this client?" lookup
+can be done from a phone. Bounded answers matter most there: a reply that
+fits a model's context also fits a small screen.
+
 ## Development
 
 ```bash
