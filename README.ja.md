@@ -98,16 +98,24 @@ claude.ai は、OAuth つきの HTTP でリモートの MCP サーバにつな�
 ```bash
 export MERAKI_DASHBOARD_API_KEY=...
 mcp-stdio serve --enable-oauth \
-  --public-url https://mcp.example.com/meraki \
+  --public-url https://meraki.example.com \
   --trusted-user-header X-Forwarded-User \
   --allow-redirect-uri https://claude.ai/api/mcp/auth_callback \
   --port 8080 -- merakiadm-mcp
 ```
 
 利用者をサインインさせて（手元の SSO）、利用者名を `X-Forwarded-User` で渡す
-TLS のリバースプロキシの後ろで動かします。オプションは mcp-stdio の文書を
-見てください。そのうえで、claude.ai のカスタムコネクタに
-`https://mcp.example.com/meraki/mcp` を足します。同じコネクタがブラウザ・
+TLS のリバースプロキシの後ろで動かします。プロキシは、クライアントが送って
+きた `X-Forwarded-User` を必ず取り除いてください。mcp-stdio はこのヘッダを
+信じるので、素通しになると、クライアントが別の利用者になりすませます。
+上の例のように、専用のホスト名を使ってください。mcp-stdio の文書に、claude.ai
+のコネクタはエンドポイントのパスが `/mcp` ちょうどであることを前提にする、と
+あります。claude.ai の「サインインなし」で足すコネクタには、
+`--allow-client-id-url https://claude.ai/oauth/mcp-oauth-client-metadata` も
+要ります。これらのオプションは mcp-stdio の文書を見てください。
+
+そのうえで、claude.ai のカスタムコネクタに `https://meraki.example.com/mcp` を
+足します。同じコネクタがブラウザ・
 デスクトップアプリ・スマホのアプリで使えるので、朝の点検や「この端末は
 どこにいる？」の確認がスマホからできます。上限つきの答えは、そこでいちばん
 効きます。モデルの文脈に収まる答えは、小さな画面にも収まります。

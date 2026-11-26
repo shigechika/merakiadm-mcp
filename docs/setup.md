@@ -53,16 +53,24 @@ endpoint with an embedded OAuth 2.1 authorization server, and starts one
 ```bash
 export MERAKI_DASHBOARD_API_KEY=...
 mcp-stdio serve --enable-oauth \
-  --public-url https://mcp.example.com/meraki \
+  --public-url https://meraki.example.com \
   --trusted-user-header X-Forwarded-User \
   --allow-redirect-uri https://claude.ai/api/mcp/auth_callback \
   --port 8080 -- merakiadm-mcp
 ```
 
 Run it behind a TLS reverse proxy that signs users in (your SSO) and passes
-the user name in `X-Forwarded-User`; see the mcp-stdio documentation for the
-options. Then add `https://mcp.example.com/meraki/mcp` as a custom connector
-in claude.ai. The same connector works in the browser, the desktop app and
+the user name in `X-Forwarded-User`. The proxy must strip any
+`X-Forwarded-User` header a client sends: mcp-stdio trusts that header, so
+a copy that gets through lets a client pose as another user. Give the server
+its own host name, as above: mcp-stdio's documentation notes that claude.ai
+connectors expect the endpoint path to be exactly `/mcp`. A connector added
+with claude.ai's "No sign-in" option also needs
+`--allow-client-id-url https://claude.ai/oauth/mcp-oauth-client-metadata`;
+see the mcp-stdio documentation for these options.
+
+Then add `https://meraki.example.com/mcp` as a custom connector in
+claude.ai. The same connector works in the browser, the desktop app and
 the mobile apps, so the morning check or a "where is this client?" lookup
 can be done from a phone. Bounded answers matter most there: a reply that
 fits a model's context also fits a small screen.
