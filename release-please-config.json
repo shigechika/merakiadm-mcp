@@ -3,17 +3,68 @@
   "packages": {
     ".": {
       "release-type": "python",
+      "package-name": "merakiadm-mcp",
+      "include-component-in-tag": false,
+      "release-as": "0.0.1",
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "merakiadm_mcp/__init__.py"
+        },
+        {
+          "type": "json",
+          "path": "server.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "server.json",
+          "jsonpath": "$.packages[0].version"
+        }
+      ],
       "changelog-path": "CHANGELOG.md",
       "changelog-sections": [
-        { "type": "feat", "section": "Features" },
-        { "type": "fix", "section": "Bug Fixes" },
-        { "type": "perf", "section": "Performance" },
-        { "type": "refactor", "section": "Refactoring" },
-        { "type": "docs", "section": "Documentation", "hidden": true },
-        { "type": "test", "section": "Tests", "hidden": true },
-        { "type": "build", "section": "Build", "hidden": true },
-        { "type": "ci", "section": "CI", "hidden": true },
-        { "type": "chore", "section": "Chores", "hidden": true }
+        {
+          "type": "feat",
+          "section": "Features"
+        },
+        {
+          "type": "fix",
+          "section": "Bug Fixes"
+        },
+        {
+          "type": "perf",
+          "section": "Performance"
+        },
+        {
+          "type": "refactor",
+          "section": "Refactoring"
+        },
+        {
+          "type": "docs",
+          "section": "Documentation",
+          "hidden": true
+        },
+        {
+          "type": "test",
+          "section": "Tests",
+          "hidden": true
+        },
+        {
+          "type": "build",
+          "section": "Build",
+          "hidden": true
+        },
+        {
+          "type": "ci",
+          "section": "CI",
+          "hidden": true
+        },
+        {
+          "type": "chore",
+          "section": "Chores",
+          "hidden": true
+        }
       ]
     }
   }

@@ -4,4 +4,4 @@ Exposes bounded, aggregated device, connection, Air Marshal and event
 summaries to MCP-compatible AI assistants via STDIO transport.
 """
 
-__version__ = "0.0.0"
+__version__ = "0.0.0"  # x-release-please-version
