@@ -182,8 +182,8 @@ def test_security_events_marks_capped_pages():
 @respx.mock
 def test_clat_conflicts_are_counted_apart():
     base_routes()
-    clat = {"occurredAt": "2026-11-25T08:00:00Z", "type": "client_ip_conflict", "eventData": {"ip": "192.0.0.2"}}
-    real = {"occurredAt": "2026-11-25T08:00:00Z", "type": "client_ip_conflict", "eventData": {"ip": "198.51.100.7"}}
+    clat = {"occurredAt": _recent(60), "type": "client_ip_conflict", "eventData": {"ip": "192.0.0.2"}}
+    real = {"occurredAt": _recent(60), "type": "client_ip_conflict", "eventData": {"ip": "198.51.100.7"}}
     respx.get(f"{BASE}/networks/N_1/events").mock(return_value=httpx.Response(200, json={"events": [clat, clat, real]}))
     text = server.security_events(hours=24, top=5)
     assert "- Total: 2" in text  # one real conflict per product type queried
@@ -269,10 +269,11 @@ def daily_routes(stats, events=(), ports=None, avail=None, changes=(), ops=(), p
     respx.get(f"{BASE}/organizations/100/licenses/overview").mock(return_value=httpx.Response(200, json={"status": "OK", "expirationDate": "Jan 1, 2099 UTC"}))
 
 
+# Relative times: the change log is trimmed to the window, so fixed dates would age out.
 CHANGES = [
-    {"ts": "2026-11-25T01:00:00Z", "adminName": "alice", "networkId": "N_1", "networkName": "Example Net", "ssidName": "CorpNet", "page": "Access control", "label": "Ssid psk", "oldValue": "s1", "newValue": "s2"},
-    {"ts": "2026-11-25T02:00:00Z", "adminName": "bob", "networkId": None, "page": "Administrators", "label": "Create admin", "oldValue": "", "newValue": "x" * 300},
-    {"ts": "2026-11-25T03:00:00Z", "adminName": "bob", "networkId": "N_9", "page": "Other", "label": "Elsewhere", "oldValue": "a", "newValue": "b"},
+    {"ts": _recent(180), "adminName": "alice", "networkId": "N_1", "networkName": "Example Net", "ssidName": "CorpNet", "page": "Access control", "label": "Ssid psk", "oldValue": "s1", "newValue": "s2"},
+    {"ts": _recent(120), "adminName": "bob", "networkId": None, "page": "Administrators", "label": "Create admin", "oldValue": "", "newValue": "x" * 300},
+    {"ts": _recent(60), "adminName": "bob", "networkId": "N_9", "page": "Other", "label": "Elsewhere", "oldValue": "a", "newValue": "b"},
 ]
 
 

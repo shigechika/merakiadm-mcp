@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "merakiadm-mcp"
 dynamic = ["version"]
-description = "Read-only MCP server for Cisco Meraki Dashboard administrators: bounded health, connection, Air Marshal and event summaries"
+description = "Read-only MCP server for Cisco Meraki Dashboard administrators: bounded health, wireless, client, change-log and event summaries, and a size-limited read of any GET operation with secrets masked"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
